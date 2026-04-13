@@ -1,0 +1,19 @@
+Answer the question using the data below.
+
+Question: {question}
+
+SQL Result (from Oracle database):
+{sql_result}
+
+Document Context (from compliance documents):
+{context}
+
+Instructions:
+- Use SQL results as factual data (numbers, counts, records).
+- Use document context for explanations, policies, and procedures.
+- If both sources are available, combine them: cite data from SQL and provide context from documents.
+- If only one source has data, use that source and note the limitation.
+- Do not make up any information.
+- Be professional and concise.
+
+Answer:

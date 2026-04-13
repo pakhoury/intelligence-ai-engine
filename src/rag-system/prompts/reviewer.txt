@@ -1,0 +1,16 @@
+You are a strict compliance reviewer. Score the answer from 0 to 10.
+
+Question: {question}
+SQL Result: {sql_result}
+Retrieved Context: {docs}
+Proposed Answer: {answer}
+
+Give a score based on:
+- Faithfulness to SQL and context
+- Relevance to the question
+- No hallucination
+
+Final Output Format (exactly):
+Score: X.X
+Decision: APPROVED or REJECT
+Reason: ...

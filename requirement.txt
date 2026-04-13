@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+langgraph
+langchain
+langchain-groq
+langchain-community
+langchain-huggingface
+langchain-text-splitters
+sentence-transformers
+oracledb
+sqlalchemy
+redis
+pydantic
+python-dotenv
+psycopg2-binary
+pypdf
+pgvector

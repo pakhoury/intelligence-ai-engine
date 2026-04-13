@@ -1,0 +1,44 @@
+{
+  "compliance-policy-2024.pdf": {
+    "title": "Corporate Compliance Policy 2024",
+    "department": "Compliance",
+    "document_type": "policy",
+    "year": "2024",
+    "category": "general",
+    "tags": ["policy", "compliance", "AML", "KYC", "data-privacy", "code-of-conduct"],
+    "effective_date": "2024-01-01",
+    "review_date": "2024-12-31"
+  },
+  "risk-management-framework-v2.pdf": {
+    "title": "Risk Management Framework v2.0",
+    "department": "Risk",
+    "document_type": "framework",
+    "year": "2025",
+    "category": "market_risk",
+    "tags": ["risk", "framework", "VaR", "credit-risk", "operational-risk", "liquidity", "stress-testing"],
+    "effective_date": "2025-03-01",
+    "version": "2.0"
+  },
+  "q3-2024-audit-report.pdf": {
+    "title": "Q3 2024 Internal Audit Report",
+    "department": "Audit",
+    "document_type": "report",
+    "year": "2024",
+    "category": "audit",
+    "tags": ["audit", "quarterly", "KYC", "trade-surveillance", "access-control", "findings"],
+    "report_date": "2024-10-10",
+    "period": "Q3-2024"
+  },
+  "soe-45678-incident-report.pdf": {
+    "title": "SOE-45678 Compliance Incident Report",
+    "department": "Compliance",
+    "document_type": "incident",
+    "year": "2024",
+    "category": "violation",
+    "soe_id": "45678",
+    "severity": "HIGH",
+    "tags": ["incident", "unauthorized-trading", "DMA", "cross-trade", "SEC", "FINRA"],
+    "detection_date": "2024-08-15",
+    "status": "under_investigation"
+  }
+}

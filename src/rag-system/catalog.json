@@ -1,0 +1,63 @@
+{
+  "schemas": {
+    "COMPLIANCE": {
+      "tables": {
+        "COMPLIANCE_VIOLATIONS": {
+          "description": "Core table storing all compliance violations and regulatory breaches",
+          "columns": {
+            "VIOLATION_ID": "Unique identifier for each violation",
+            "SOE_ID": "Employee SOE ID who committed or is associated with the violation",
+            "EMPLOYEE_NAME": "Full name of the employee",
+            "DEPARTMENT": "Department where the employee belongs",
+            "VIOLATION_DATE": "Date when the violation occurred",
+            "VIOLATION_TYPE": "Type of violation (AML, KYC, Conflict of Interest, Data Privacy, etc.)",
+            "SEVERITY": "Severity level: Low, Medium, High, Critical",
+            "STATUS": "Current status: Open, In Progress, Closed, Escalated",
+            "CLOSURE_DATE": "Date when violation was closed",
+            "REGULATORY_BODY": "Regulatory body involved (RBI, SEBI, etc.)",
+            "FINANCIAL_IMPACT": "Financial penalty or loss amount in USD"
+          }
+        },
+        "AUDIT_FINDINGS": {
+          "description": "Internal and external audit findings",
+          "columns": {
+            "FINDING_ID": "Unique audit finding ID",
+            "AUDIT_TYPE": "Internal Audit / External Audit / Regulatory Inspection",
+            "DEPARTMENT": "Audited department",
+            "FINDING_DATE": "Date finding was raised",
+            "DESCRIPTION": "Detailed description of the finding",
+            "RISK_RATING": "Risk rating: Low, Medium, High",
+            "STATUS": "Status of the finding"
+          }
+        },
+        "CONTROL_MAPPINGS": {
+          "description": "Mapping between controls and compliance requirements",
+          "columns": {
+            "CONTROL_ID": "Unique control identifier",
+            "CONTROL_NAME": "Name of the control",
+            "CONTROL_OWNER_DEPT": "Department that owns the control",
+            "COMPLIANCE_REQUIREMENT": "Related compliance or regulation",
+            "EFFECTIVE_DATE": "Date control became effective",
+            "TEST_FREQUENCY": "How often the control is tested"
+          }
+        }
+      }
+    },
+    "RISK": {
+      "tables": {
+        "RISK_EVENTS": {
+          "description": "All risk incidents and loss events",
+          "columns": {
+            "EVENT_ID": "Unique risk event ID",
+            "SOE_ID": "Employee SOE ID",
+            "DEPARTMENT": "Department",
+            "EVENT_DATE": "Date of risk event",
+            "RISK_CATEGORY": "Risk category (Operational, Credit, Market, etc.)",
+            "LOSS_AMOUNT": "Financial loss amount",
+            "EVENT_DESCRIPTION": "Description of the event"
+          }
+        }
+      }
+    }
+  }
+}

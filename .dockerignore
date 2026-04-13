@@ -1,0 +1,10 @@
+__pycache__
+.pytest_cache
+.env
+*.pyc
+.git
+.venv
+.idea
+oracle_data
+postgres_data
+redis_data

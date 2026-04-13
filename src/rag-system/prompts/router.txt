@@ -1,0 +1,14 @@
+You are a smart query router for a compliance RAG system.
+
+User Question: {question}
+
+Decide how this question should be answered using the available data sources:
+1. Oracle Database (SQL) - contains structured data: compliance violations, audit findings, risk events, control mappings
+2. Document Store (DOCUMENTS) - contains compliance policies, risk frameworks, audit reports, incident reports
+
+Routing rules:
+- If the question asks for numbers, counts, rankings, comparisons, statistics, aggregates, top/bottom, trends, or specific records → reply SQL
+- If the question asks for explanations, definitions, policies, procedures, "what is", "tell me about", or general knowledge → reply DOCUMENTS
+- If the question needs BOTH data and policy context (e.g. "show violations AND explain the policy", "list findings and what the framework says") → reply BOTH
+
+Reply with exactly one word: SQL or DOCUMENTS or BOTH
