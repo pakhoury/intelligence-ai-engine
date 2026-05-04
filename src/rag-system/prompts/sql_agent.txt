@@ -10,7 +10,9 @@ Rules:
 - Generate a clean and correct SELECT query only.
 - Always add this at the end: FETCH FIRST 500 ROWS ONLY
 - Never use SELECT *, DELETE, UPDATE, or DROP.
-- Only use the tables and columns from the given schema.
-- If you cannot answer using the given tables, reply with: NO_SQL_POSSIBLE
+- Only use the tables and columns explicitly listed in the schema above.
+- When joining tables, verify that each column belongs to the table it is referenced from. Do NOT reference a column from a table that does not list it.
+- Use table aliases consistently (e.g., cv for COMPLIANCE_VIOLATIONS) and double-check that every alias.COLUMN pair is valid for that table.
+- If you cannot answer using the given tables and columns, reply with: NO_SQL_POSSIBLE
 
 Return ONLY the SQL query. No explanation.

@@ -1,4 +1,5 @@
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict
 from nodes import (
     cache_check, router_node, clarification_node, sql_path,
@@ -7,6 +8,8 @@ from nodes import (
 
 class AgentState(TypedDict, total=False):
     question: str
+    session_id: str
+    conversation_history: list  # [{"question": ..., "answer": ...}, ...]
     cache_hit: bool
     final_answer: str
     review_score: float
@@ -71,4 +74,5 @@ workflow.add_edge("answer_generator", "reviewer")
 workflow.add_edge("reviewer", "cache_write")
 workflow.add_edge("cache_write", END)
 
-app = workflow.compile()
+checkpointer = MemorySaver()
+app = workflow.compile(checkpointer=checkpointer)

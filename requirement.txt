@@ -15,3 +15,25 @@ python-dotenv
 psycopg2-binary
 pypdf
 pgvector
+openpyxl
+
+# Observability - OpenTelemetry
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-fastapi
+
+# Observability - Prometheus
+prometheus-client
+
+# Security
+slowapi
+python-multipart
+
+# Reliability
+tenacity
+
+# Testing (dev)
+pytest
+pytest-asyncio
+pytest-cov

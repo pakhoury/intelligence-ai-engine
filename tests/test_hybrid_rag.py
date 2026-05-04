@@ -5,18 +5,14 @@ Tests all three routing scenarios: SQL-only, Documents-only, and Both.
 Prerequisites:
   - docker-compose up -d (Oracle, Postgres, Redis running)
   - python ingest/ingest.py (documents ingested into PGVector)
-  - OPENAI_API_KEY set in .env
+  - GROQ_API_KEY set in .env
 
 Usage:
-  cd src/rag-system
-  python -m pytest ../../tests/test_hybrid_rag.py -v -s
-  OR
-  python ../../tests/test_hybrid_rag.py
+  python tests/test_hybrid_rag.py
 """
 import sys
 import os
 import asyncio
-import json
 
 # Add src/rag-system to path so imports work
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "rag-system"))
@@ -91,7 +87,7 @@ DOC_QUERIES = [
     },
     {
         "name": "DOCS: Risk management framework",
-        "question": "Explain our risk appetite statement and stress testing methodology",
+        "question": "Explain the three lines of defense model in our risk management governance structure",
         "expect_route": "documents",
         "expect_sql": False,
         "expect_docs": True,
@@ -154,7 +150,12 @@ ALL_TEST_GROUPS = [
 
 async def run_single_test(workflow_app, test_case: dict) -> dict:
     """Run a single test and return the result with pass/fail info."""
-    result = await workflow_app.ainvoke({"question": test_case["question"]})
+    import uuid
+    thread_id = f"test-{uuid.uuid4().hex[:8]}"
+    result = await workflow_app.ainvoke(
+        {"question": test_case["question"]},
+        config={"configurable": {"thread_id": thread_id}},
+    )
     print_result(test_case["name"], result)
 
     checks = []
@@ -203,6 +204,14 @@ async def run_single_test(workflow_app, test_case: dict) -> dict:
 
 async def run_all_tests():
     from workflow import app as workflow_app
+    from config import redis_client
+
+    # Flush cached answers so every query exercises the full pipeline
+    try:
+        redis_client.flushdb()
+        print("Redis cache flushed — starting with clean state.\n")
+    except Exception as e:
+        print(f"WARNING: Could not flush Redis cache: {e}\n")
 
     all_results = []
     total_pass = 0

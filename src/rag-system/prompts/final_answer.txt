@@ -1,6 +1,9 @@
 Answer the question using the data below.
 
-Question: {question}
+Conversation History:
+{conversation_history}
+
+Current Question: {question}
 
 SQL Result (from Oracle database):
 {sql_result}
@@ -13,6 +16,8 @@ Instructions:
 - Use document context for explanations, policies, and procedures.
 - If both sources are available, combine them: cite data from SQL and provide context from documents.
 - If only one source has data, use that source and note the limitation.
+- If the user is referring to something from the conversation history (e.g. "tell me more", "what about those"), use the history to understand the reference and answer in context.
+- Do not repeat information the user already received unless they ask for it.
 - Do not make up any information.
 - Be professional and concise.
 
