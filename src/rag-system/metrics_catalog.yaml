@@ -1,0 +1,354 @@
+metrics:
+
+  compliance_effectiveness_score:
+    name: "Compliance Effectiveness Score"
+    description: >
+      Measures overall compliance program effectiveness by calculating the percentage
+      of compliance violations that have been successfully resolved (closed) out of
+      all violations recorded within a given time period.
+    category: "compliance"
+    unit: "%"
+    formula: "(number of closed violations / total number of violations) * 100"
+    tables:
+      - "COMPLIANCE_VIOLATIONS"
+    steps:
+      - step: 1
+        action: "Count the total number of compliance violations in the time period"
+        uses: "COMPLIANCE_VIOLATIONS table, VIOLATION_DATE column for date filtering"
+      - step: 2
+        action: "Count the number of violations where STATUS is 'Closed'"
+        uses: "COMPLIANCE_VIOLATIONS table, STATUS column"
+      - step: 3
+        action: "Divide closed count by total count, multiply by 100 to get percentage"
+        note: "Handle division by zero if no violations exist"
+    parameters:
+      - name: "lookback_months"
+        description: "Number of months to look back from today"
+        type: "integer"
+        default: 12
+      - name: "department"
+        description: "Filter results to a specific department"
+        type: "string"
+        optional: true
+    thresholds:
+      critical:
+        max: 60
+        label: "Critical - Immediate action required"
+        description: "Less than 60% of violations resolved indicates systemic compliance failures"
+      warning:
+        min: 60
+        max: 80
+        label: "Warning - Needs improvement"
+        description: "Between 60-80% resolution rate suggests gaps in compliance processes"
+      good:
+        min: 80
+        max: 95
+        label: "Good - On track"
+        description: "80-95% resolution rate indicates a healthy compliance program"
+      excellent:
+        min: 95
+        label: "Excellent - Best in class"
+        description: "Above 95% demonstrates exceptional compliance management"
+    interpretation: >
+      This score reflects how effectively the organization identifies, addresses, and
+      closes compliance violations. A declining trend may indicate resource constraints
+      or emerging regulatory complexity.
+
+  violation_severity_distribution:
+    name: "Violation Severity Distribution"
+    description: >
+      Breaks down compliance violations by severity level (Low, Medium, High, Critical)
+      to understand the risk profile of outstanding and historical violations.
+    category: "compliance"
+    unit: "count"
+    formula: "Count of violations grouped by SEVERITY level, optionally also broken down by STATUS"
+    tables:
+      - "COMPLIANCE_VIOLATIONS"
+    steps:
+      - step: 1
+        action: "Count violations grouped by SEVERITY column"
+        uses: "COMPLIANCE_VIOLATIONS table, SEVERITY column"
+      - step: 2
+        action: "Also break down by STATUS within each severity for actionable insight"
+        uses: "STATUS column"
+      - step: 3
+        action: "Order results by severity priority: Critical first, then High, Medium, Low"
+        note: "Use CASE expression for custom ordering"
+    parameters:
+      - name: "lookback_months"
+        description: "Number of months to look back"
+        type: "integer"
+        default: 12
+      - name: "department"
+        description: "Filter by department"
+        type: "string"
+        optional: true
+    thresholds:
+      critical:
+        condition: "any Critical severity with status Open or Escalated"
+        label: "Critical - Open critical violations require immediate escalation"
+      warning:
+        condition: "more than 5 High severity violations in Open status"
+        label: "Warning - High severity backlog building up"
+      good:
+        condition: "no Critical open, fewer than 5 High open"
+        label: "Good - Severity distribution is manageable"
+    interpretation: >
+      A healthy organization should have few or no open Critical violations and a
+      decreasing trend of High severity items. A concentration of open High/Critical
+      violations in a single department may indicate targeted remediation is needed.
+
+  audit_finding_resolution_rate:
+    name: "Audit Finding Resolution Rate"
+    description: >
+      Measures the percentage of audit findings that have been resolved, providing
+      insight into how effectively the organization addresses internal and external
+      audit observations.
+    category: "audit"
+    unit: "%"
+    formula: "(number of resolved audit findings / total audit findings) * 100"
+    tables:
+      - "AUDIT_FINDINGS"
+    steps:
+      - step: 1
+        action: "Count all audit findings in the period"
+        uses: "AUDIT_FINDINGS table, FINDING_DATE column for date filtering"
+      - step: 2
+        action: "Count findings where STATUS indicates resolution (Closed or Resolved)"
+        uses: "AUDIT_FINDINGS table, STATUS column"
+      - step: 3
+        action: "Divide resolved by total and express as percentage"
+        note: "Handle division by zero if no findings exist"
+    parameters:
+      - name: "lookback_months"
+        description: "Number of months to look back"
+        type: "integer"
+        default: 12
+      - name: "audit_type"
+        description: "Filter by audit type (Internal Audit, External Audit, Regulatory Inspection)"
+        type: "string"
+        optional: true
+      - name: "department"
+        description: "Filter by audited department"
+        type: "string"
+        optional: true
+    thresholds:
+      critical:
+        max: 50
+        label: "Critical - Audit findings are not being addressed"
+      warning:
+        min: 50
+        max: 75
+        label: "Warning - Audit remediation pace is too slow"
+      good:
+        min: 75
+        max: 90
+        label: "Good - Most findings are being resolved"
+      excellent:
+        min: 90
+        label: "Excellent - Strong audit remediation culture"
+    interpretation: >
+      This rate indicates organizational responsiveness to audit observations.
+      Low resolution rates may attract regulatory scrutiny and signal weak
+      internal controls. Track by audit_type to identify if external vs internal
+      findings have different closure velocity.
+
+  regulatory_exposure_index:
+    name: "Regulatory Exposure Index"
+    description: >
+      Calculates the total financial exposure from open compliance violations,
+      aggregated by regulatory body. This metric quantifies the potential financial
+      risk if open violations result in penalties.
+    category: "risk"
+    unit: "USD"
+    formula: "Sum of FINANCIAL_IMPACT for all violations where STATUS is not Closed, grouped by REGULATORY_BODY"
+    tables:
+      - "COMPLIANCE_VIOLATIONS"
+    steps:
+      - step: 1
+        action: "Filter violations to only those that are not closed (STATUS != 'Closed')"
+        uses: "COMPLIANCE_VIOLATIONS table, STATUS column"
+      - step: 2
+        action: "Sum the FINANCIAL_IMPACT column, also compute max and average exposure"
+        uses: "FINANCIAL_IMPACT column, treat null values as zero"
+      - step: 3
+        action: "Group results by REGULATORY_BODY to see exposure per regulator"
+        uses: "REGULATORY_BODY column"
+      - step: 4
+        action: "Count the number of open violations per regulatory body"
+        uses: "COUNT of violations per group"
+      - step: 5
+        action: "Order by total exposure descending to show highest risk first"
+    parameters:
+      - name: "lookback_months"
+        description: "Number of months to look back"
+        type: "integer"
+        default: 24
+      - name: "department"
+        description: "Filter by department"
+        type: "string"
+        optional: true
+    thresholds:
+      critical:
+        condition: "total exposure exceeds 1000000"
+        label: "Critical - Significant financial exposure requiring board attention"
+      warning:
+        condition: "total exposure between 100000 and 1000000"
+        label: "Warning - Material financial exposure"
+      good:
+        condition: "total exposure below 100000"
+        label: "Good - Exposure within acceptable tolerance"
+    interpretation: >
+      This index helps quantify regulatory risk in financial terms. Rising exposure
+      concentrated in a single regulatory body may indicate systemic non-compliance
+      in that regulatory domain. Compare against risk appetite thresholds set by
+      the board.
+
+  department_risk_score:
+    name: "Department Risk Score"
+    description: >
+      Composite risk score per department calculated from the weighted combination
+      of open violations (by severity), unresolved audit findings, and recorded
+      risk events. Higher score indicates higher risk.
+    category: "risk"
+    unit: "score"
+    formula: "(critical_violations * 10 + high_violations * 5 + medium_violations * 2 + low_violations * 1) + (open_audit_findings * 3) + (risk_events * 4)"
+    tables:
+      - "COMPLIANCE_VIOLATIONS"
+      - "AUDIT_FINDINGS"
+      - "RISK_EVENTS"
+    steps:
+      - step: 1
+        action: "For each department, calculate a weighted violation score from non-closed violations"
+        uses: "COMPLIANCE_VIOLATIONS table, weight Critical=10, High=5, Medium=2, Low=1 based on SEVERITY column"
+      - step: 2
+        action: "For each department, count open audit findings and multiply by weight 3"
+        uses: "AUDIT_FINDINGS table, STATUS not in (Closed, Resolved), DEPARTMENT column"
+      - step: 3
+        action: "For each department, count risk events and multiply by weight 4"
+        uses: "RISK_EVENTS table, DEPARTMENT column"
+      - step: 4
+        action: "Combine all three component scores per department into a composite risk score"
+        note: "Use FULL OUTER JOIN or UNION to handle departments that appear in only some tables. Show component breakdown alongside the composite score."
+    parameters:
+      - name: "lookback_months"
+        description: "Number of months to look back"
+        type: "integer"
+        default: 12
+    thresholds:
+      critical:
+        min: 50
+        label: "Critical - Department requires immediate risk mitigation"
+      warning:
+        min: 20
+        max: 50
+        label: "Warning - Elevated risk, monitoring recommended"
+      good:
+        max: 20
+        label: "Good - Department risk within acceptable range"
+    interpretation: >
+      This composite score normalizes different risk indicators into a single
+      comparable number. Use it to prioritize which departments need targeted
+      compliance interventions. The component breakdown (violation vs audit vs
+      risk events) reveals the primary risk driver.
+
+  control_coverage_ratio:
+    name: "Control Coverage Ratio"
+    description: >
+      Measures what percentage of compliance requirements have at least one
+      active control mapped to them. Gaps indicate areas where the organization
+      lacks controls to enforce compliance.
+    category: "governance"
+    unit: "%"
+    formula: "(count of distinct compliance requirements with active controls / total distinct compliance requirements) * 100"
+    tables:
+      - "CONTROL_MAPPINGS"
+    steps:
+      - step: 1
+        action: "Count the total number of distinct compliance requirements"
+        uses: "CONTROL_MAPPINGS table, COMPLIANCE_REQUIREMENT column"
+      - step: 2
+        action: "Count distinct compliance requirements that have at least one active control (EFFECTIVE_DATE on or before today)"
+        uses: "CONTROL_MAPPINGS table, EFFECTIVE_DATE column"
+      - step: 3
+        action: "Divide covered requirements by total requirements and express as percentage"
+        note: "Handle division by zero"
+    parameters:
+      - name: "department"
+        description: "Filter by control owner department"
+        type: "string"
+        optional: true
+    thresholds:
+      critical:
+        max: 70
+        label: "Critical - Significant control gaps exist"
+      warning:
+        min: 70
+        max: 90
+        label: "Warning - Some compliance requirements lack controls"
+      good:
+        min: 90
+        max: 100
+        label: "Good - Strong control coverage"
+      excellent:
+        min: 100
+        label: "Excellent - Full control coverage"
+    interpretation: >
+      Control coverage below 100% means some regulatory requirements have no
+      enforcing control. Prioritize gaps in high-risk regulatory areas.
+      Track TEST_FREQUENCY to ensure existing controls are being validated.
+
+  mean_time_to_resolution:
+    name: "Mean Time to Resolution"
+    description: >
+      Calculates the average number of days it takes to close a compliance
+      violation from the date it was reported. This operational metric reflects
+      the speed of the compliance remediation process.
+    category: "operations"
+    unit: "days"
+    formula: "Average of (CLOSURE_DATE - VIOLATION_DATE) for all closed violations"
+    tables:
+      - "COMPLIANCE_VIOLATIONS"
+    steps:
+      - step: 1
+        action: "Filter to only closed violations that have both VIOLATION_DATE and CLOSURE_DATE"
+        uses: "COMPLIANCE_VIOLATIONS table, STATUS = 'Closed', CLOSURE_DATE IS NOT NULL"
+      - step: 2
+        action: "For each violation, compute the number of days between VIOLATION_DATE and CLOSURE_DATE"
+        uses: "Date arithmetic: CLOSURE_DATE - VIOLATION_DATE gives days in Oracle"
+      - step: 3
+        action: "Calculate average, minimum, maximum, and median resolution times"
+        note: "Also include the count of closed violations for context"
+    parameters:
+      - name: "lookback_months"
+        description: "Number of months to look back"
+        type: "integer"
+        default: 12
+      - name: "severity"
+        description: "Filter by violation severity"
+        type: "string"
+        optional: true
+      - name: "department"
+        description: "Filter by department"
+        type: "string"
+        optional: true
+    thresholds:
+      critical:
+        min: 90
+        label: "Critical - Violations taking too long to resolve (>90 days avg)"
+      warning:
+        min: 45
+        max: 90
+        label: "Warning - Resolution time is elevated (45-90 days avg)"
+      good:
+        min: 15
+        max: 45
+        label: "Good - Reasonable resolution time (15-45 days avg)"
+      excellent:
+        max: 15
+        label: "Excellent - Fast resolution cycle (<15 days avg)"
+    interpretation: >
+      Long resolution times increase regulatory exposure and may compound
+      financial impact. Break down by severity — Critical violations should
+      resolve faster than Low severity. Departmental variance may indicate
+      resource allocation issues.

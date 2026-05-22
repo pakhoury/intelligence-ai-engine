@@ -1,15 +1,9 @@
 """
-Integration tests for the LangGraph workflow — verifies conditional routing
-with all external dependencies mocked.
+Integration tests for the LangGraph workflow — verifies conditional routing,
+chained strategies, and reflection loop with all external dependencies mocked.
 """
 import pytest
-from unittest.mock import MagicMock, patch
-
-
-def _mock_llm_response(content):
-    resp = MagicMock()
-    resp.content = content
-    return resp
+from unittest.mock import MagicMock, AsyncMock, patch
 
 
 @pytest.fixture
@@ -17,10 +11,14 @@ def mock_deps():
     """Patch all external dependencies so the compiled graph can run."""
     with (
         patch("nodes.redis_client") as mock_redis,
-        patch("nodes.llm") as mock_llm,
+        patch("nodes._ainvoke_llm", new_callable=AsyncMock) as mock_ainvoke,
         patch("nodes.db_connector") as mock_db,
         patch("nodes._get_vector_store") as mock_vs_fn,
+        patch("nodes._get_metrics_catalog") as mock_catalog_fn,
     ):
+        from metrics import MetricsCatalog
+        mock_catalog_fn.return_value = MetricsCatalog()
+
         # Defaults
         mock_redis.get.return_value = None
         mock_redis.set.return_value = True
@@ -38,7 +36,7 @@ def mock_deps():
 
         yield {
             "redis": mock_redis,
-            "llm": mock_llm,
+            "ainvoke": mock_ainvoke,
             "db": mock_db,
             "vector_store_fn": mock_vs_fn,
             "vector_store": mock_store,
@@ -46,11 +44,11 @@ def mock_deps():
 
 
 class TestWorkflowCacheHitPath:
-    def test_cache_hit_ends_immediately(self, mock_deps):
+    async def test_cache_hit_ends_immediately(self, mock_deps):
         mock_deps["redis"].get.return_value = "Cached answer"
         from workflow import app as workflow_app
 
-        result = workflow_app.invoke(
+        result = await workflow_app.ainvoke(
             {
                 "question": "How many violations?",
                 "session_id": "s1",
@@ -60,23 +58,21 @@ class TestWorkflowCacheHitPath:
         )
         assert result["cache_hit"] is True
         assert result["final_answer"] == "Cached answer"
-        # LLM should never be called on cache hit
-        mock_deps["llm"].invoke.assert_not_called()
+        mock_deps["ainvoke"].assert_not_called()
 
 
 class TestWorkflowSQLRoute:
-    def test_sql_only_route(self, mock_deps):
-        llm = mock_deps["llm"]
-        llm.invoke.side_effect = [
-            _mock_llm_response("SQL"),                                # router
-            _mock_llm_response("NO_CLARIFICATION_NEEDED"),            # clarify
-            _mock_llm_response("SELECT COUNT(*) FROM VIOLATIONS"),    # sql_agent
-            _mock_llm_response("There are 2 critical violations."),   # answer
-            _mock_llm_response("Score: 9.0\nDecision: APPROVED"),     # reviewer
+    async def test_sql_only_route(self, mock_deps):
+        mock_deps["ainvoke"].side_effect = [
+            "SQL_ONLY",                               # router
+            "NO_CLARIFICATION_NEEDED",                # clarify
+            "SELECT COUNT(*) FROM VIOLATIONS",        # sql_agent
+            "There are 2 critical violations.",        # answer
+            "Score: 9.0\nDecision: APPROVED",          # reviewer
         ]
         from workflow import app as workflow_app
 
-        result = workflow_app.invoke(
+        result = await workflow_app.ainvoke(
             {
                 "question": "How many violations?",
                 "session_id": "s1",
@@ -84,25 +80,23 @@ class TestWorkflowSQLRoute:
             },
             config={"configurable": {"thread_id": "test-sql-route"}},
         )
-        assert result["route"] == "sql"
+        assert result["route"] == "sql_only"
         assert result["final_answer"] == "There are 2 critical violations."
         assert result["review_score"] == 9.0
-        # Vector store should NOT be called for sql-only route
         mock_deps["vector_store"].similarity_search.assert_not_called()
 
 
 class TestWorkflowDocumentsRoute:
-    def test_documents_only_route(self, mock_deps):
-        llm = mock_deps["llm"]
-        llm.invoke.side_effect = [
-            _mock_llm_response("DOCUMENTS"),                          # router
-            _mock_llm_response("NO_CLARIFICATION_NEEDED"),            # clarify
-            _mock_llm_response("The KYC policy requires..."),         # answer
-            _mock_llm_response("Score: 8.0\nDecision: APPROVED"),     # reviewer
+    async def test_documents_only_route(self, mock_deps):
+        mock_deps["ainvoke"].side_effect = [
+            "DOCS_ONLY",                              # router
+            "NO_CLARIFICATION_NEEDED",                # clarify
+            "The KYC policy requires...",              # answer
+            "Score: 8.0\nDecision: APPROVED",          # reviewer
         ]
         from workflow import app as workflow_app
 
-        result = workflow_app.invoke(
+        result = await workflow_app.ainvoke(
             {
                 "question": "What is KYC policy?",
                 "session_id": "s1",
@@ -110,48 +104,104 @@ class TestWorkflowDocumentsRoute:
             },
             config={"configurable": {"thread_id": "test-docs-route"}},
         )
-        assert result["route"] == "documents"
+        assert result["route"] == "docs_only"
         assert "KYC" in result["final_answer"]
-        # SQL connector should NOT be called for documents-only route
         mock_deps["db"].execute_query.assert_not_called()
 
 
-class TestWorkflowBothRoute:
-    def test_both_route_hits_sql_then_docs(self, mock_deps):
-        llm = mock_deps["llm"]
-        llm.invoke.side_effect = [
-            _mock_llm_response("BOTH"),                               # router
-            _mock_llm_response("NO_CLARIFICATION_NEEDED"),            # clarify
-            _mock_llm_response("SELECT * FROM VIOLATIONS"),           # sql_agent
-            _mock_llm_response("Combined answer with data + policy"), # answer
-            _mock_llm_response("Score: 8.5\nDecision: APPROVED"),     # reviewer
+class TestWorkflowParallelRoute:
+    async def test_parallel_route_hits_sql_then_docs(self, mock_deps):
+        mock_deps["ainvoke"].side_effect = [
+            "PARALLEL",                               # router
+            "NO_CLARIFICATION_NEEDED",                # clarify
+            "SELECT * FROM VIOLATIONS",               # sql_agent
+            "Combined answer with data + policy",      # answer
+            "Score: 8.5\nDecision: APPROVED",          # reviewer
         ]
         from workflow import app as workflow_app
 
-        result = workflow_app.invoke(
+        result = await workflow_app.ainvoke(
             {
                 "question": "Show KYC violations and explain the policy",
                 "session_id": "s1",
                 "conversation_history": [],
             },
-            config={"configurable": {"thread_id": "test-both-route"}},
+            config={"configurable": {"thread_id": "test-parallel-route"}},
         )
-        assert result["route"] == "both"
-        # Both data sources should have been called
+        assert result["route"] == "parallel"
         mock_deps["db"].execute_query.assert_called_once()
         mock_deps["vector_store"].similarity_search.assert_called_once()
 
 
-class TestWorkflowClarificationPath:
-    def test_clarification_ends_early(self, mock_deps):
-        llm = mock_deps["llm"]
-        llm.invoke.side_effect = [
-            _mock_llm_response("DOCUMENTS"),                          # router
-            _mock_llm_response("Could you be more specific?"),        # clarify (needs it)
+class TestWorkflowDocsThenSqlRoute:
+    async def test_docs_then_sql_chains_through_extract(self, mock_deps):
+        mock_deps["ainvoke"].side_effect = [
+            "DOCS_THEN_SQL",                                          # router
+            "NO_CLARIFICATION_NEEDED",                                # clarify
+            # vector_retrieval doesn't call LLM — it just searches
+            "SUM(fine_amount + remediation_cost + audit_fees)",       # extract
+            "SELECT SUM(fine_amount) FROM COMPLIANCE_VIOLATIONS",     # sql_agent
+            "The compliance cost for 2024 is $2.4M.",                 # answer
+            "Score: 9.0\nDecision: APPROVED",                          # reviewer
         ]
         from workflow import app as workflow_app
 
-        result = workflow_app.invoke(
+        result = await workflow_app.ainvoke(
+            {
+                "question": "What is the compliance cost for 2024?",
+                "session_id": "s1",
+                "conversation_history": [],
+            },
+            config={"configurable": {"thread_id": "test-docs-then-sql"}},
+        )
+        assert result["route"] == "docs_then_sql"
+        assert result["extracted_context"] == "SUM(fine_amount + remediation_cost + audit_fees)"
+        # Both sources must be called: docs first, then SQL
+        mock_deps["vector_store"].similarity_search.assert_called_once()
+        mock_deps["db"].execute_query.assert_called_once()
+        assert "$2.4M" in result["final_answer"]
+
+
+class TestWorkflowSqlThenDocsRoute:
+    async def test_sql_then_docs_chains_through_extract(self, mock_deps):
+        mock_deps["ainvoke"].side_effect = [
+            "SQL_THEN_DOCS",                                         # router
+            "NO_CLARIFICATION_NEEDED",                               # clarify
+            "SELECT type, COUNT(*) FROM VIOLATIONS GROUP BY type",   # sql_agent
+            "ACCESS_CONTROL",                                         # extract
+            # vector_retrieval doesn't call LLM — it just searches
+            "ACCESS_CONTROL had 47 incidents. The policy states...",  # answer
+            "Score: 9.0\nDecision: APPROVED",                         # reviewer
+        ]
+        from workflow import app as workflow_app
+
+        result = await workflow_app.ainvoke(
+            {
+                "question": "Most common violation and its policy?",
+                "session_id": "s1",
+                "conversation_history": [],
+            },
+            config={"configurable": {"thread_id": "test-sql-then-docs"}},
+        )
+        assert result["route"] == "sql_then_docs"
+        assert result["extracted_context"] == "ACCESS_CONTROL"
+        # Both sources must be called: SQL first, then docs
+        mock_deps["db"].execute_query.assert_called_once()
+        mock_deps["vector_store"].similarity_search.assert_called_once()
+        # Vector search should use the extracted context, not the raw question
+        search_query = mock_deps["vector_store"].similarity_search.call_args[0][0]
+        assert search_query == "ACCESS_CONTROL"
+
+
+class TestWorkflowClarificationPath:
+    async def test_clarification_ends_early(self, mock_deps):
+        mock_deps["ainvoke"].side_effect = [
+            "DOCS_ONLY",                              # router
+            "Could you be more specific?",            # clarify (needs it)
+        ]
+        from workflow import app as workflow_app
+
+        result = await workflow_app.ainvoke(
             {
                 "question": "Show me the data",
                 "session_id": "s1",
@@ -161,23 +211,23 @@ class TestWorkflowClarificationPath:
         )
         assert result["needs_clarification"] is True
         assert "specific" in result["final_answer"].lower()
-        # Should NOT proceed to retrieval or answer generation
         mock_deps["db"].execute_query.assert_not_called()
         mock_deps["vector_store"].similarity_search.assert_not_called()
 
 
 class TestWorkflowCacheWrite:
-    def test_low_score_does_not_cache(self, mock_deps):
-        llm = mock_deps["llm"]
-        llm.invoke.side_effect = [
-            _mock_llm_response("DOCUMENTS"),
-            _mock_llm_response("NO_CLARIFICATION_NEEDED"),
-            _mock_llm_response("Some answer"),
-            _mock_llm_response("Score: 3.0\nDecision: REJECT"),
+    async def test_low_score_does_not_cache(self, mock_deps):
+        mock_deps["ainvoke"].side_effect = [
+            "DOCS_ONLY",                                                # router
+            "NO_CLARIFICATION_NEEDED",                                  # clarify
+            "Some answer",                                              # answer (attempt 0)
+            "Score: 3.0\nDecision: REJECT\nReason: Too vague",        # reviewer (attempt 1, reflect)
+            "Slightly better answer",                                   # answer (reflection 1)
+            "Score: 5.0\nDecision: REJECT\nReason: Still incomplete",  # reviewer (attempt 2, max)
         ]
         from workflow import app as workflow_app
 
-        workflow_app.invoke(
+        await workflow_app.ainvoke(
             {
                 "question": "What is AML?",
                 "session_id": "s1",
@@ -185,20 +235,18 @@ class TestWorkflowCacheWrite:
             },
             config={"configurable": {"thread_id": "test-low-score"}},
         )
-        # Redis set should NOT be called for low-score answers
         mock_deps["redis"].set.assert_not_called()
 
-    def test_high_score_caches(self, mock_deps):
-        llm = mock_deps["llm"]
-        llm.invoke.side_effect = [
-            _mock_llm_response("DOCUMENTS"),
-            _mock_llm_response("NO_CLARIFICATION_NEEDED"),
-            _mock_llm_response("AML stands for Anti-Money Laundering."),
-            _mock_llm_response("Score: 9.0\nDecision: APPROVED"),
+    async def test_high_score_caches(self, mock_deps):
+        mock_deps["ainvoke"].side_effect = [
+            "DOCS_ONLY",                              # router
+            "NO_CLARIFICATION_NEEDED",                # clarify
+            "AML stands for Anti-Money Laundering.",  # answer
+            "Score: 9.0\nDecision: APPROVED",          # reviewer
         ]
         from workflow import app as workflow_app
 
-        workflow_app.invoke(
+        await workflow_app.ainvoke(
             {
                 "question": "What is AML?",
                 "session_id": "s1",
@@ -206,4 +254,31 @@ class TestWorkflowCacheWrite:
             },
             config={"configurable": {"thread_id": "test-high-score"}},
         )
+        mock_deps["redis"].set.assert_called_once()
+
+
+class TestWorkflowReflection:
+    async def test_reflection_improves_answer(self, mock_deps):
+        """Low score triggers reflection; improved answer passes on second attempt."""
+        mock_deps["ainvoke"].side_effect = [
+            "DOCS_ONLY",                                                # router
+            "NO_CLARIFICATION_NEEDED",                                  # clarify
+            "Weak answer",                                              # answer (attempt 0)
+            "Score: 4.0\nDecision: REJECT\nReason: Too vague",        # reviewer (attempt 1, reflect)
+            "Strong detailed answer about AML compliance",              # answer (reflection)
+            "Score: 9.0\nDecision: APPROVED\nReason: Comprehensive",   # reviewer (attempt 2, pass)
+        ]
+        from workflow import app as workflow_app
+
+        result = await workflow_app.ainvoke(
+            {
+                "question": "What is AML?",
+                "session_id": "s1",
+                "conversation_history": [],
+            },
+            config={"configurable": {"thread_id": "test-reflection"}},
+        )
+        assert result["final_answer"] == "Strong detailed answer about AML compliance"
+        assert result["review_score"] == 9.0
+        assert result["reflection_attempt"] == 2
         mock_deps["redis"].set.assert_called_once()

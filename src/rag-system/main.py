@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 import uuid
@@ -45,6 +46,7 @@ FastAPIInstrumentor.instrument_app(app)
 
 HISTORY_TTL_SECONDS = 3600  # 1 hour
 MAX_HISTORY_TURNS = 10
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
 
 
 class Query(BaseModel):
@@ -52,10 +54,10 @@ class Query(BaseModel):
     session_id: Optional[str] = None
 
 
-def _load_history(session_id: str) -> list:
+async def _load_history(session_id: str) -> list:
     """Load conversation history from Redis."""
     try:
-        raw = redis_client.get(f"history:{session_id}")
+        raw = await asyncio.to_thread(redis_client.get, f"history:{session_id}")
         if raw:
             return json.loads(raw)
     except Exception as e:
@@ -63,14 +65,15 @@ def _load_history(session_id: str) -> list:
     return []
 
 
-def _save_history(session_id: str, history: list):
+async def _save_history(session_id: str, history: list):
     """Save conversation history to Redis with TTL."""
     try:
         trimmed = history[-MAX_HISTORY_TURNS:]
-        redis_client.set(
+        await asyncio.to_thread(
+            redis_client.set,
             f"history:{session_id}",
             json.dumps(trimmed),
-            ex=HISTORY_TTL_SECONDS,
+            HISTORY_TTL_SECONDS,
         )
     except Exception as e:
         logger.warning(f"Failed to save history: {e}", extra={"error": str(e)})
@@ -119,22 +122,25 @@ async def query(
             attributes={"rag.question_length": len(question)},
         ):
             session_id = body.session_id or str(uuid.uuid4())
-            history = _load_history(session_id)
+            history = await _load_history(session_id)
 
-            result = await workflow_app.ainvoke(
-                {
-                    "question": question,
-                    "session_id": session_id,
-                    "conversation_history": history,
-                },
-                config={"configurable": {"thread_id": session_id}},
+            result = await asyncio.wait_for(
+                workflow_app.ainvoke(
+                    {
+                        "question": question,
+                        "session_id": session_id,
+                        "conversation_history": history,
+                    },
+                    config={"configurable": {"thread_id": session_id}},
+                ),
+                timeout=REQUEST_TIMEOUT,
             )
 
             answer = result.get("final_answer", "Sorry, I could not generate an answer.")
 
             if not result.get("cache_hit"):
                 history.append({"question": question, "answer": answer})
-                _save_history(session_id, history)
+                await _save_history(session_id, history)
 
             return {
                 "answer": answer,
@@ -142,6 +148,19 @@ async def query(
                 "session_id": session_id,
                 "trace_id": trace_id_var.get("no-trace"),
             }
+    except asyncio.TimeoutError:
+        REQUEST_COUNT.labels(status="error").inc()
+        logger.error(
+            f"Request timed out after {REQUEST_TIMEOUT}s",
+            extra={"error": "timeout", "timeout_seconds": REQUEST_TIMEOUT},
+        )
+        return JSONResponse(
+            status_code=504,
+            content={
+                "error": f"Request timed out after {REQUEST_TIMEOUT} seconds",
+                "trace_id": trace_id_var.get("no-trace"),
+            },
+        )
     except Exception as e:
         REQUEST_COUNT.labels(status="error").inc()
         logger.error(f"Query failed: {e}", extra={"error": str(e)})
@@ -164,7 +183,7 @@ async def readiness():
 
     # Redis
     try:
-        redis_client.ping()
+        await asyncio.to_thread(redis_client.ping)
         checks["redis"] = "ok"
     except Exception as e:
         checks["redis"] = f"error: {e}"

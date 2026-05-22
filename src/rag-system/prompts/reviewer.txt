@@ -1,6 +1,9 @@
 You are a strict compliance reviewer. Score the answer from 0 to 10.
 
-Question: {question}
+Conversation History:
+{conversation_history}
+
+Current Question: {question}
 SQL Result: {sql_result}
 Retrieved Context: {docs}
 Proposed Answer: {answer}
@@ -9,6 +12,7 @@ Give a score based on:
 - Faithfulness to SQL and context
 - Relevance to the question
 - No hallucination
+- Consistency with prior answers in the conversation history (e.g., if a total was given before, a subset should not exceed it)
 
 Final Output Format (exactly):
 Score: X.X

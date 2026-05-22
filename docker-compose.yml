@@ -56,6 +56,8 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    volumes:
+      - ./src/rag-system:/app
     depends_on:
       oracle:
         condition: service_healthy
@@ -73,7 +75,7 @@ services:
       - ORACLE_SERVICE=XEPDB1
       - ORACLE_SCHEMA=COMPLIANCE_USER
       - OTEL_EXPORTER_OTLP_ENDPOINT=
-      - ENVIRONMENT=production
+      - ENVIRONMENT=development
       - LLM_MODEL=llama-3.3-70b-versatile
       - LLM_TIMEOUT=30
       - LLM_MAX_RETRIES=3

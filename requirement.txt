@@ -1,39 +1,56 @@
-fastapi
-uvicorn
-langgraph
-langchain
-langchain-groq
-langchain-community
-langchain-huggingface
-langchain-text-splitters
-sentence-transformers
-oracledb
-sqlalchemy
-redis
-pydantic
-python-dotenv
-psycopg2-binary
-pypdf
-pgvector
-openpyxl
+# Core Web Framework
+fastapi>=0.115.0,<1.0
+uvicorn>=0.34.0,<1.0
+
+# LLM Orchestration
+langgraph>=0.3.0,<1.0
+langchain>=0.3.0,<1.0
+langchain-core>=0.3.0,<1.0
+langchain-groq>=0.2.0,<1.0
+langchain-community>=0.3.0,<1.0
+langchain-huggingface>=0.1.0,<1.0
+langchain-text-splitters>=0.3.0,<1.0
+
+# Embeddings
+sentence-transformers>=3.0.0,<4.0
+
+# Databases
+oracledb>=2.0.0,<3.0
+sqlalchemy>=2.0.0,<3.0
+psycopg2-binary>=2.9.0,<3.0
+psycopg[binary]>=3.1.0,<4.0
+pgvector>=0.3.0,<1.0
+
+# LangGraph persistent checkpointer
+langgraph-checkpoint-postgres>=2.0.0,<3.0
+
+# Cache
+redis>=5.0.0,<6.0
+
+# Data & Validation
+pydantic>=2.0.0,<3.0
+python-dotenv>=1.0.0,<2.0
+pypdf>=4.0.0,<6.0
+openpyxl>=3.1.0,<4.0
+pyyaml>=6.0.0,<7.0
 
 # Observability - OpenTelemetry
-opentelemetry-api
-opentelemetry-sdk
-opentelemetry-exporter-otlp
-opentelemetry-instrumentation-fastapi
+opentelemetry-api>=1.25.0,<2.0
+opentelemetry-sdk>=1.25.0,<2.0
+opentelemetry-exporter-otlp>=1.25.0,<2.0
+opentelemetry-instrumentation-fastapi>=0.46b0,<1.0
 
 # Observability - Prometheus
-prometheus-client
+prometheus-client>=0.21.0,<1.0
 
 # Security
-slowapi
-python-multipart
+slowapi>=0.1.9,<1.0
+python-multipart>=0.0.9,<1.0
 
 # Reliability
-tenacity
+tenacity>=8.2.0,<10.0
 
 # Testing (dev)
-pytest
-pytest-asyncio
-pytest-cov
+pytest>=8.0.0,<9.0
+pytest-asyncio>=0.24.0,<1.0
+pytest-cov>=5.0.0,<6.0

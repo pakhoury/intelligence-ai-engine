@@ -213,3 +213,9 @@ Example output: COMPLIANCE_VIOLATIONS, CONTROL_MAPPINGS, RISK_EVENTS"""
 
     def get_dialect(self) -> str:
         return "oracle"
+
+    def get_row_limit_clause(self, limit: int = 500) -> str:
+        return f"FETCH FIRST {limit} ROWS ONLY"
+
+    def get_readiness_query(self) -> str:
+        return "SELECT 1 FROM DUAL"

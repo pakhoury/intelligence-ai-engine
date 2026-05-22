@@ -7,12 +7,23 @@ from datetime import timedelta
 from typing import Dict, Optional
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import PGVector
-from observability import logger, NodeTimer, CACHE_OPS, ROUTE_COUNT, REVIEW_SCORE
+from observability import logger, NodeTimer, CACHE_OPS, ROUTE_COUNT, REVIEW_SCORE, REFLECTION_COUNT
 from security import sanitize_for_prompt, redact_pii, dlp_scan
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from llm_ops import context_manager
+from metrics import MetricsCatalog
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+_metrics_catalog: Optional[MetricsCatalog] = None
+
+
+def _get_metrics_catalog() -> MetricsCatalog:
+    global _metrics_catalog
+    if _metrics_catalog is None:
+        _metrics_catalog = MetricsCatalog()
+    return _metrics_catalog
+
 
 _embeddings: Optional[HuggingFaceEmbeddings] = None
 _vector_store: Optional[PGVector] = None
@@ -71,7 +82,7 @@ def _parse_review_score(content: str) -> float:
     match = re.search(r"\b(\d+(?:\.\d+)?)\s*/\s*10\b", content)
     if match:
         return min(float(match.group(1)), 10.0)
-    return 7.0
+    return 0.0
 
 
 @retry(
@@ -85,12 +96,12 @@ async def _ainvoke_llm(prompt: str) -> str:
     return response.content
 
 
-def cache_check(state: Dict):
+async def cache_check(state: Dict):
     with NodeTimer("cache_check"):
         question = state["question"]
         key = _cache_key(question)
         try:
-            cached = redis_client.get(key)
+            cached = await asyncio.to_thread(redis_client.get, key)
             if cached:
                 logger.info("Cache HIT", extra={"node": "cache_check", "cache_hit": True})
                 CACHE_OPS.labels(result="hit").inc()
@@ -102,41 +113,101 @@ def cache_check(state: Dict):
         return {"cache_hit": False}
 
 
-def router_node(state: Dict):
+VALID_ROUTES = {"sql_only", "docs_only", "docs_then_sql", "sql_then_docs", "parallel"}
+
+
+async def router_node(state: Dict):
     with NodeTimer("router"):
         history = _format_history(state)
         prompt = load_prompt("router.txt").format(
             question=state["question"],
             conversation_history=history or "No prior conversation."
         )
-        response = llm.invoke(prompt)
-        content = response.content.strip().upper()
+        content = await _ainvoke_llm(prompt)
 
-        if "BOTH" in content:
-            route = "both"
-        elif "SQL" in content:
-            route = "sql"
+        normalized = content.strip().upper().replace(" ", "_")
+
+        if normalized in {v.upper() for v in VALID_ROUTES}:
+            route = normalized.lower()
+        elif "DOCS_THEN_SQL" in normalized:
+            route = "docs_then_sql"
+        elif "SQL_THEN_DOCS" in normalized:
+            route = "sql_then_docs"
+        elif "PARALLEL" in normalized or "BOTH" in normalized:
+            route = "parallel"
+        elif "SQL" in normalized and "DOC" not in normalized:
+            route = "sql_only"
+        elif "DOC" in normalized:
+            route = "docs_only"
         else:
-            route = "documents"
+            route = "parallel"
 
         logger.info(f"Route decided: {route}", extra={"node": "router", "route": route})
         ROUTE_COUNT.labels(route=route).inc()
         return {"route": route}
 
 
-def clarification_node(state: Dict):
+async def clarification_node(state: Dict):
     with NodeTimer("clarify"):
-        prompt = load_prompt("clarification.txt").format(question=state["question"])
-        response = llm.invoke(prompt)
-        if "NO_CLARIFICATION_NEEDED" in response.content.upper():
+        history = _format_history(state)
+        prompt = load_prompt("clarification.txt").format(
+            question=state["question"],
+            conversation_history=history or "No prior conversation.",
+        )
+        content = await _ainvoke_llm(prompt)
+        if "NO_CLARIFICATION_NEEDED" in content.upper():
             logger.info("No clarification needed", extra={"node": "clarify"})
             return {"needs_clarification": False}
         logger.info("Clarification needed", extra={"node": "clarify"})
         return {
             "needs_clarification": True,
-            "final_answer": response.content.strip(),
+            "final_answer": content.strip(),
             "review_score": 10.0
         }
+
+
+EXTRACT_INSTRUCTIONS = {
+    "docs_then_sql": (
+        "Extract the formula, definition, calculation method, or criteria from the "
+        "documents that is needed to answer the question using a database query."
+    ),
+    "sql_then_docs": (
+        "Extract the key entity names, types, or specific terms from the data results "
+        "that should be used to search for relevant policies or documents."
+    ),
+}
+
+
+async def extract_node(state: Dict):
+    with NodeTimer("extract"):
+        route = state.get("route", "")
+        question = state["question"]
+
+        if route == "docs_then_sql":
+            source_material = "\n".join(state.get("retrieved_docs", []))
+        elif route == "sql_then_docs":
+            source_material = state.get("sql_result", "")
+        else:
+            return {}
+
+        if not source_material or source_material.startswith("Error"):
+            logger.warning("Extract skipped: no usable source material", extra={"node": "extract"})
+            return {"extracted_context": ""}
+
+        instruction = EXTRACT_INSTRUCTIONS[route]
+        prompt = load_prompt("extract.txt").format(
+            question=question,
+            source_material=source_material,
+            instruction=instruction,
+        )
+        content = await _ainvoke_llm(prompt)
+
+        if "EXTRACTION_FAILED" in content.upper():
+            logger.warning("Extraction failed, proceeding without context", extra={"node": "extract"})
+            return {"extracted_context": ""}
+
+        logger.info(f"Extracted context: {content.strip()[:200]}", extra={"node": "extract"})
+        return {"extracted_context": content.strip()}
 
 
 def _strip_sql_fences(sql: str) -> str:
@@ -151,17 +222,33 @@ def _strip_sql_fences(sql: str) -> str:
 MAX_SQL_RETRIES = 2
 
 
-def sql_path(state: Dict):
+async def sql_path(state: Dict):
     with NodeTimer("sql_path"):
         question = state["question"]
         logger.info(f"Generating SQL for: {question}", extra={"node": "sql_path"})
 
-        tables = db_connector.get_relevant_tables(question)
-        schema = db_connector.get_table_schema(tables)
+        tables = await asyncio.to_thread(db_connector.get_relevant_tables, question)
+        schema = await asyncio.to_thread(db_connector.get_table_schema, tables)
+
+        metric_definitions = _get_metrics_catalog().build_all_context()
+
+        history = _format_history(state)
+
         base_prompt = load_prompt("sql_agent.txt").format(
             question=question,
             schema_description=schema,
+            metric_definitions=metric_definitions,
+            conversation_history=history or "No prior conversation.",
         )
+
+        extracted = state.get("extracted_context")
+        if extracted:
+            base_prompt += (
+                f"\n\nA prior research step found this relevant definition/context:\n"
+                f"{extracted}\n\n"
+                f"Use this to inform your SQL query — it tells you which columns "
+                f"and calculations to use."
+            )
 
         last_error = None
 
@@ -175,7 +262,8 @@ def sql_path(state: Dict):
                     f"Fix the issue and return ONLY the corrected SQL query."
                 )
 
-            sql = _strip_sql_fences(llm.invoke(prompt).content.strip())
+            content = await _ainvoke_llm(prompt)
+            sql = _strip_sql_fences(content.strip())
             logger.info(
                 f"Generated SQL (attempt {attempt + 1}): {sql}",
                 extra={"node": "sql_path", "sql": sql},
@@ -184,8 +272,7 @@ def sql_path(state: Dict):
             if "NO_SQL_POSSIBLE" in sql.upper():
                 return {"sql_result": "N/A - query cannot be answered with available tables"}
 
-            # Validate column references against catalog
-            col_error = db_connector.validate_columns(sql, tables)
+            col_error = await asyncio.to_thread(db_connector.validate_columns, sql, tables)
             if col_error:
                 last_error = col_error
                 logger.warning(
@@ -196,8 +283,7 @@ def sql_path(state: Dict):
                     continue
                 return {"sql_result": f"Error: {last_error}"}
 
-            # Execute query
-            sql_result = db_connector.execute_query(sql)
+            sql_result = await asyncio.to_thread(db_connector.execute_query, sql)
 
             if sql_result.startswith(("Execution Error:", "Error:")):
                 last_error = sql_result
@@ -211,17 +297,19 @@ def sql_path(state: Dict):
 
             sql_result = redact_pii(sql_result)
             logger.info(f"SQL result: {sql_result[:200]}", extra={"node": "sql_path"})
-            return {"sql_result": sql_result}
+            return {"sql_result": f"Query:\n{sql}\n\nResult:\n{sql_result}"}
 
 
-def vector_retrieval(state: Dict):
+async def vector_retrieval(state: Dict):
     with NodeTimer("vector_retrieval"):
         question = state["question"]
-        logger.info(f"Searching documents for: {question}", extra={"node": "vector_retrieval"})
+        extracted = state.get("extracted_context")
+        search_query = extracted if extracted else question
+        logger.info(f"Searching documents for: {search_query}", extra={"node": "vector_retrieval"})
 
         try:
             store = _get_vector_store()
-            results = store.similarity_search(question, k=4)
+            results = await asyncio.to_thread(store.similarity_search, search_query, k=4)
             docs = []
             for doc in results:
                 source = doc.metadata.get("title", doc.metadata.get("source", "Unknown"))
@@ -233,17 +321,20 @@ def vector_retrieval(state: Dict):
             return {"retrieved_docs": []}
 
 
-def answer_generator(state: Dict):
+async def answer_generator(state: Dict):
     with NodeTimer("answer_generator"):
         route = state.get("route", "documents")
-        logger.info(f"Generating answer (route={route})", extra={"node": "answer_generator", "route": route})
+        attempt = state.get("reflection_attempt", 0)
+        logger.info(f"Generating answer (route={route}, reflection={attempt})", extra={"node": "answer_generator", "route": route})
+
+        if attempt > 0:
+            REFLECTION_COUNT.inc()
 
         history = _format_history(state)
         prompt_template = load_prompt("final_answer.txt")
         sql_result = state.get("sql_result", "N/A - no SQL data retrieved")
         docs = "\n".join(state.get("retrieved_docs", [])) or "N/A - no documents retrieved"
 
-        # Truncate content to fit context window
         fitted = context_manager.truncate_to_fit(
             prompt_template=prompt_template,
             question=state["question"],
@@ -258,22 +349,36 @@ def answer_generator(state: Dict):
             context=fitted.get("docs", docs),
             conversation_history=fitted.get("history", history or "No prior conversation."),
         )
-        response = llm.invoke(prompt)
-        return {"final_answer": response.content}
+
+        if attempt > 0 and state.get("reviewer_feedback"):
+            prompt += (
+                f"\n\nYour previous answer was reviewed and scored below the quality threshold.\n"
+                f"Reviewer feedback:\n{state['reviewer_feedback']}\n\n"
+                f"Please provide an improved answer addressing the reviewer's concerns."
+            )
+
+        content = await _ainvoke_llm(prompt)
+        return {"final_answer": content}
 
 
-def reviewer_node(state: Dict):
+async def reviewer_node(state: Dict):
     with NodeTimer("reviewer"):
+        history = _format_history(state)
         prompt = load_prompt("reviewer.txt").format(
             question=state["question"],
             sql_result=state.get("sql_result", ""),
             docs=state.get("retrieved_docs", ""),
-            answer=state.get("final_answer", "")
+            answer=state.get("final_answer", ""),
+            conversation_history=history or "No prior conversation.",
         )
-        response = llm.invoke(prompt)
-        score = _parse_review_score(response.content)
+        content = await _ainvoke_llm(prompt)
+        score = _parse_review_score(content)
 
-        result = {"review_score": score}
+        result = {
+            "review_score": score,
+            "reflection_attempt": state.get("reflection_attempt", 0) + 1,
+            "reviewer_feedback": content.strip(),
+        }
 
         answer = state.get("final_answer", "")
         scan = dlp_scan(answer)
@@ -290,12 +395,14 @@ def reviewer_node(state: Dict):
         return result
 
 
-def cache_write(state: Dict):
+async def cache_write(state: Dict):
     with NodeTimer("cache_write"):
         if state.get("review_score", 0) >= 7.0 and state.get("final_answer"):
             key = _cache_key(state["question"])
             try:
-                redis_client.set(key, state["final_answer"], ex=timedelta(hours=24))
+                await asyncio.to_thread(
+                    redis_client.set, key, state["final_answer"], timedelta(hours=24),
+                )
                 logger.info("Cached answer", extra={"node": "cache_write"})
             except Exception as e:
                 logger.warning(f"Cache write failed: {e}", extra={"node": "cache_write", "error": str(e)})

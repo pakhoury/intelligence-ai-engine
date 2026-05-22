@@ -5,14 +5,21 @@ Conversation History:
 
 Current Question: {question}
 
-Decide how this question should be answered using the available data sources:
-1. Oracle Database (SQL) - contains structured data: compliance violations, audit findings, risk events, control mappings
-2. Document Store (DOCUMENTS) - contains compliance policies, risk frameworks, audit reports, incident reports
+Decide the best execution strategy using the available data sources:
+1. Oracle Database (SQL) - contains structured data: compliance violations, audit findings, risk events, control mappings, financial amounts
+2. Document Store (DOCUMENTS) - contains compliance policies, risk frameworks, formulas, definitions, audit reports, incident procedures
 
-Routing rules:
-- If the question asks for numbers, counts, rankings, comparisons, statistics, aggregates, top/bottom, trends, or specific records → reply SQL
-- If the question asks for explanations, definitions, policies, procedures, "what is", "tell me about", or general knowledge → reply DOCUMENTS
-- If the question needs BOTH data and policy context (e.g. "show violations AND explain the policy", "list findings and what the framework says") → reply BOTH
-- If the question references something from the conversation history (e.g. "tell me more", "what about", "explain that"), use the history to understand what the user is referring to and route accordingly.
+Strategies:
+- SQL_ONLY: Question answerable purely from database (counts, totals, rankings, comparisons, specific records, trends)
+- DOCS_ONLY: Question about policies, definitions, procedures, explanations, frameworks
+- DOCS_THEN_SQL: Question needs a formula, definition, or criteria from documents BEFORE querying the database (e.g., "what is the compliance cost" needs the cost formula from docs first, then SQL to calculate it)
+- SQL_THEN_DOCS: Question needs a data result BEFORE looking up its context in documents (e.g., "top violation and its policy" needs the violation name from SQL first, then search docs for that specific policy)
+- PARALLEL: Question needs both data and document context but neither depends on the other (e.g., "list violations and summarize the framework")
 
-Reply with exactly one word: SQL or DOCUMENTS or BOTH
+Key distinctions:
+- If the question uses a term that requires a definition or formula to query correctly → DOCS_THEN_SQL
+- If the question asks to find something in data and then explain/contextualize it → SQL_THEN_DOCS
+- If the question needs both sources but they can be fetched independently → PARALLEL
+- If the question references something from the conversation history, use the history to understand the reference and route accordingly.
+
+Reply with exactly one word: SQL_ONLY or DOCS_ONLY or DOCS_THEN_SQL or SQL_THEN_DOCS or PARALLEL

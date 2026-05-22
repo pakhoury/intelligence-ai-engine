@@ -97,6 +97,12 @@ REVIEW_SCORE = Histogram(
     registry=REGISTRY,
 )
 
+REFLECTION_COUNT = Counter(
+    "rag_reflection_total",
+    "Total reflection loop iterations",
+    registry=REGISTRY,
+)
+
 LLM_COST = Counter(
     "rag_llm_cost_usd",
     "Estimated LLM cost in USD",
