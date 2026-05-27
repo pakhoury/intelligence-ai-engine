@@ -185,7 +185,7 @@ class ModelFallbackChain:
 PROMPT_VERSIONS: Dict[str, str] = {
     "router.txt": "v2.0-history-aware",
     "clarification.txt": "v1.1-conservative",
-    "sql_agent.txt": "v2.0-oracle-join-validation",
+    "sql_agent.txt": "v3.0-unified-metric-aware",
     "final_answer.txt": "v2.0-history-aware",
     "reviewer.txt": "v1.0-score-format",
 }

@@ -12,10 +12,16 @@ from security import sanitize_for_prompt, redact_pii, dlp_scan
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from llm_ops import context_manager
 from metrics import MetricsCatalog
+from metrics.loader import load_metrics_catalog
+from metrics.llm_resolver import LLMMetricResolver
+from metrics.registry import MetricDefinition
+from circuit_breaker import llm_circuit_breaker, CircuitBreakerOpen
+from validators import validate_sql_safety, run_all_validators
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 _metrics_catalog: Optional[MetricsCatalog] = None
+_metric_resolver: Optional[LLMMetricResolver] = None
 
 
 def _get_metrics_catalog() -> MetricsCatalog:
@@ -23,6 +29,14 @@ def _get_metrics_catalog() -> MetricsCatalog:
     if _metrics_catalog is None:
         _metrics_catalog = MetricsCatalog()
     return _metrics_catalog
+
+
+def _get_metric_resolver() -> LLMMetricResolver:
+    global _metric_resolver
+    if _metric_resolver is None:
+        registry = load_metrics_catalog()
+        _metric_resolver = LLMMetricResolver(registry, _ainvoke_llm, load_prompt)
+    return _metric_resolver
 
 
 _embeddings: Optional[HuggingFaceEmbeddings] = None
@@ -43,7 +57,7 @@ def _get_vector_store() -> PGVector:
         pg_password = os.getenv("POSTGRES_PASSWORD", "postgres")
         pg_host = os.getenv("POSTGRES_HOST", "localhost")
         pg_db = os.getenv("POSTGRES_DB", "rag_db")
-        connection = f"postgresql+psycopg2://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
+        connection = f"postgresql+psycopg://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
         _vector_store = PGVector(
             collection_name="compliance_docs",
             connection_string=connection,
@@ -92,8 +106,16 @@ def _parse_review_score(content: str) -> float:
     reraise=True,
 )
 async def _ainvoke_llm(prompt: str) -> str:
-    response = await llm.ainvoke(prompt)
-    return response.content
+    llm_circuit_breaker.before_call()
+    try:
+        response = await llm.ainvoke(prompt)
+        llm_circuit_breaker.record_success()
+        return response.content
+    except CircuitBreakerOpen:
+        raise
+    except Exception as e:
+        llm_circuit_breaker.record_failure()
+        raise
 
 
 async def cache_check(state: Dict):
@@ -210,6 +232,78 @@ async def extract_node(state: Dict):
         return {"extracted_context": content.strip()}
 
 
+def _build_metric_context(metric: MetricDefinition, extracted_params: Dict) -> str:
+    effective_params = metric.get_default_params()
+    effective_params.update(extracted_params)
+
+    lines = [
+        f"Metric: {metric.name} ({metric.qualified_id})",
+        f"Formula: {metric.formula}",
+        f"Unit: {metric.unit}",
+        f"Tables: {', '.join(metric.tables)}",
+    ]
+
+    if metric.steps:
+        lines.append("\nCalculation Steps:")
+        for step in metric.steps:
+            lines.append(f"  {step.get('step', '?')}. {step.get('action', '')}")
+            if step.get("uses"):
+                lines.append(f"     Uses: {step['uses']}")
+            if step.get("note"):
+                lines.append(f"     Note: {step['note']}")
+
+    if effective_params:
+        lines.append("\nParameters (extracted from user question):")
+        for name, value in effective_params.items():
+            source = "user" if name in extracted_params else "default"
+            lines.append(f"  {name} = {value} ({source})")
+
+    if metric.thresholds:
+        lines.append("\nThresholds:")
+        for level, t in metric.thresholds.items():
+            lines.append(f"  {level}: {t.get('label', '')}")
+
+    if metric.interpretation:
+        lines.append(f"\nInterpretation: {metric.interpretation.strip()}")
+
+    return "\n".join(lines)
+
+
+async def metric_resolver_node(state: Dict):
+    with NodeTimer("metric_resolver"):
+        question = state["question"]
+        resolver = _get_metric_resolver()
+        resolved = await resolver.resolve(question)
+
+        if resolved is None:
+            logger.info(
+                "No metric matched — falling back to catalog-driven SQL",
+                extra={"node": "metric_resolver", "resolved": False},
+            )
+            return {"resolved_metric": None}
+
+        metric_context = _build_metric_context(
+            resolved.metric, resolved.extracted_params,
+        )
+
+        logger.info(
+            f"Metric resolved: {resolved.metric.qualified_id} "
+            f"(confidence={resolved.confidence:.2f})",
+            extra={
+                "node": "metric_resolver",
+                "metric": resolved.metric.metric_id,
+                "version": resolved.metric.version,
+                "confidence": resolved.confidence,
+                "params": resolved.extracted_params,
+            },
+        )
+        return {
+            "resolved_metric": resolved.metric.metric_id,
+            "metric_version": resolved.metric.version,
+            "metric_context": metric_context,
+        }
+
+
 def _strip_sql_fences(sql: str) -> str:
     """Remove markdown code fences from LLM-generated SQL."""
     if sql.startswith("```"):
@@ -225,19 +319,40 @@ MAX_SQL_RETRIES = 2
 async def sql_path(state: Dict):
     with NodeTimer("sql_path"):
         question = state["question"]
-        logger.info(f"Generating SQL for: {question}", extra={"node": "sql_path"})
 
-        tables = await asyncio.to_thread(db_connector.get_relevant_tables, question)
+        logger.info(f"Generating SQL via LLM for: {question}", extra={"node": "sql_path"})
+
+        try:
+            table_prompt = db_connector.build_table_selection_prompt(question)
+            table_response = await _ainvoke_llm(table_prompt)
+            tables = db_connector.parse_table_selection(table_response)
+        except Exception as e:
+            logger.warning(
+                f"LLM table selection failed, using keyword fallback: {e}",
+                extra={"node": "sql_path", "error": str(e)},
+            )
+            tables = await asyncio.to_thread(db_connector.get_relevant_tables, question)
         schema = await asyncio.to_thread(db_connector.get_table_schema, tables)
 
-        metric_definitions = _get_metrics_catalog().build_all_context()
-
         history = _format_history(state)
+
+        metric_context = state.get("metric_context")
+        if metric_context:
+            metric_section = (
+                "Resolved Metric Definition (follow this formula, "
+                "adapting for any user modifiers):\n"
+                f"{metric_context}"
+            )
+        else:
+            metric_section = (
+                "Known Metric Definitions:\n"
+                f"{_get_metrics_catalog().build_all_context()}"
+            )
 
         base_prompt = load_prompt("sql_agent.txt").format(
             question=question,
             schema_description=schema,
-            metric_definitions=metric_definitions,
+            metric_section=metric_section,
             conversation_history=history or "No prior conversation.",
         )
 
@@ -271,6 +386,17 @@ async def sql_path(state: Dict):
 
             if "NO_SQL_POSSIBLE" in sql.upper():
                 return {"sql_result": "N/A - query cannot be answered with available tables"}
+
+            safety = validate_sql_safety(sql)
+            if not safety.passed:
+                last_error = "; ".join(safety.failures)
+                logger.warning(
+                    f"SQL safety check failed (attempt {attempt + 1}): {last_error}",
+                    extra={"node": "sql_path", "error": last_error},
+                )
+                if attempt < MAX_SQL_RETRIES:
+                    continue
+                return {"sql_result": f"Error: SQL blocked by safety validator — {last_error}"}
 
             col_error = await asyncio.to_thread(db_connector.validate_columns, sql, tables)
             if col_error:
@@ -350,6 +476,14 @@ async def answer_generator(state: Dict):
             conversation_history=fitted.get("history", history or "No prior conversation."),
         )
 
+        metric_context = state.get("metric_context")
+        if metric_context:
+            prompt += (
+                f"\n\nThis answer is based on a registered metric:\n"
+                f"{metric_context}\n"
+                f"Reference the metric name and version in your answer for auditability."
+            )
+
         if attempt > 0 and state.get("reviewer_feedback"):
             prompt += (
                 f"\n\nYour previous answer was reviewed and scored below the quality threshold.\n"
@@ -373,6 +507,27 @@ async def reviewer_node(state: Dict):
         )
         content = await _ainvoke_llm(prompt)
         score = _parse_review_score(content)
+
+        sql_result = state.get("sql_result", "")
+        sql_query = ""
+        if sql_result and "Query:\n" in sql_result:
+            sql_query = sql_result.split("Query:\n", 1)[1].split("\n\nResult:\n", 1)[0]
+
+        _, validator_failures, score_cap = run_all_validators(
+            sql=sql_query,
+            sql_result=sql_result,
+            answer=state.get("final_answer", ""),
+            retrieved_docs=state.get("retrieved_docs", []),
+            route=state.get("route", ""),
+        )
+
+        if validator_failures:
+            logger.warning(
+                f"Deterministic validation failures: {validator_failures}",
+                extra={"node": "reviewer", "validator_failures": validator_failures},
+            )
+            score = min(score, score_cap)
+            content += f"\n\n[Validator]: {'; '.join(validator_failures)}"
 
         result = {
             "review_score": score,

@@ -157,6 +157,155 @@ class TestExtractNode:
         assert result == {}
 
 
+class TestMetricResolverNode:
+    @patch("nodes._get_metric_resolver")
+    async def test_resolved_metric_builds_context(self, mock_resolver_fn, sample_state):
+        """When a metric is resolved, metric_context contains the full definition."""
+        from metrics.registry import MetricDefinition, MetricParameter, MetricSQL, SQLSelectExpr
+        from metrics.resolver import ResolvedMetric
+
+        metric = MetricDefinition(
+            metric_id="compliance_effectiveness_score",
+            name="Compliance Effectiveness Score",
+            version="1.0",
+            description="test",
+            category="compliance",
+            unit="%",
+            formula="(closed / total) * 100",
+            tables=("COMPLIANCE_VIOLATIONS",),
+            sql=MetricSQL(base_table="COMPLIANCE_VIOLATIONS",
+                          select=(SQLSelectExpr("COUNT(*)", "total"),),
+                          filters=()),
+            parameters=(
+                MetricParameter(name="lookback_months", description="", type="integer", default="12"),
+                MetricParameter(name="department", description="", type="string", optional=True),
+            ),
+            steps=(
+                {"step": 1, "action": "Count total violations"},
+                {"step": 2, "action": "Count closed violations"},
+            ),
+        )
+        resolved = ResolvedMetric(
+            metric=metric,
+            confidence=0.95,
+            matched_keyword="compliance effectiveness",
+            extracted_params={"lookback_months": "6", "department": "Legal"},
+        )
+        mock_resolver = MagicMock()
+        mock_resolver.resolve = AsyncMock(return_value=resolved)
+        mock_resolver_fn.return_value = mock_resolver
+
+        from nodes import metric_resolver_node
+        result = await metric_resolver_node(sample_state)
+
+        assert result["resolved_metric"] == "compliance_effectiveness_score"
+        assert result["metric_version"] == "1.0"
+        assert "compiled_sql" not in result
+        assert "(closed / total) * 100" in result["metric_context"]
+        assert "lookback_months = 6 (user)" in result["metric_context"]
+        assert "department = Legal (user)" in result["metric_context"]
+        assert "Count total violations" in result["metric_context"]
+
+    @patch("nodes._get_metric_resolver")
+    async def test_no_match_returns_none(self, mock_resolver_fn, sample_state):
+        """When no metric matches, resolved_metric is None and no metric_context."""
+        mock_resolver = MagicMock()
+        mock_resolver.resolve = AsyncMock(return_value=None)
+        mock_resolver_fn.return_value = mock_resolver
+
+        from nodes import metric_resolver_node
+        result = await metric_resolver_node(sample_state)
+
+        assert result["resolved_metric"] is None
+        assert "metric_context" not in result
+        assert "compiled_sql" not in result
+
+
+class TestBuildMetricContext:
+    def test_includes_formula_and_tables(self):
+        from nodes import _build_metric_context
+        from metrics.registry import MetricDefinition, MetricParameter
+
+        metric = MetricDefinition(
+            metric_id="test_metric",
+            name="Test Metric",
+            version="1.0",
+            description="test",
+            category="test",
+            unit="%",
+            formula="(a / b) * 100",
+            tables=("TABLE_A", "TABLE_B"),
+            parameters=(
+                MetricParameter(name="lookback_months", description="", type="integer", default="12"),
+            ),
+            steps=(
+                {"step": 1, "action": "Count a", "uses": "TABLE_A"},
+                {"step": 2, "action": "Count b", "note": "Handle zero"},
+            ),
+            thresholds={"good": {"label": "Good"}},
+            interpretation="Higher is better.",
+        )
+        ctx = _build_metric_context(metric, {"lookback_months": "6"})
+
+        assert "Test Metric (test_metric@1.0)" in ctx
+        assert "(a / b) * 100" in ctx
+        assert "TABLE_A, TABLE_B" in ctx
+        assert "lookback_months = 6 (user)" in ctx
+        assert "Count a" in ctx
+        assert "Uses: TABLE_A" in ctx
+        assert "Note: Handle zero" in ctx
+        assert "good: Good" in ctx
+        assert "Higher is better." in ctx
+
+    def test_default_params_labeled_correctly(self):
+        from nodes import _build_metric_context
+        from metrics.registry import MetricDefinition, MetricParameter
+
+        metric = MetricDefinition(
+            metric_id="m", name="M", version="1.0", description="d",
+            category="c", unit="u", formula="f",
+            parameters=(
+                MetricParameter(name="lookback_months", description="", type="integer", default="12"),
+                MetricParameter(name="department", description="", type="string", optional=True),
+            ),
+        )
+        ctx = _build_metric_context(metric, {})
+        assert "lookback_months = 12 (default)" in ctx
+        assert "department" not in ctx
+
+    def test_extra_params_included(self):
+        """Params not in the metric definition (e.g. business_key) still appear."""
+        from nodes import _build_metric_context
+        from metrics.registry import MetricDefinition, MetricParameter
+
+        metric = MetricDefinition(
+            metric_id="m", name="M", version="1.0", description="d",
+            category="c", unit="u", formula="f",
+            parameters=(
+                MetricParameter(name="lookback_months", description="", type="integer", default="12"),
+            ),
+        )
+        ctx = _build_metric_context(metric, {"lookback_months": "6", "business_key": "88"})
+        assert "lookback_months = 6 (user)" in ctx
+        assert "business_key = 88 (user)" in ctx
+
+    def test_minimal_metric_no_optional_sections(self):
+        """Metric with no steps, thresholds, or interpretation produces clean output."""
+        from nodes import _build_metric_context
+        from metrics.registry import MetricDefinition
+
+        metric = MetricDefinition(
+            metric_id="m", name="M", version="1.0", description="d",
+            category="c", unit="u", formula="f", tables=("T",),
+        )
+        ctx = _build_metric_context(metric, {})
+        assert "M (m@1.0)" in ctx
+        assert "Calculation Steps" not in ctx
+        assert "Parameters" not in ctx
+        assert "Thresholds" not in ctx
+        assert "Interpretation" not in ctx
+
+
 class TestSqlPath:
     @patch("nodes._get_metrics_catalog")
     @patch("nodes.db_connector")
@@ -164,10 +313,14 @@ class TestSqlPath:
     async def test_generates_and_executes_sql(self, mock_ainvoke, mock_db, mock_catalog_fn, sample_state):
         from metrics import MetricsCatalog
         mock_catalog_fn.return_value = MetricsCatalog()
-        mock_db.get_relevant_tables.return_value = ["COMPLIANCE_VIOLATIONS"]
+        mock_db.build_table_selection_prompt.return_value = "table selection prompt"
+        mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
         mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS\nColumns: ..."
         mock_db.validate_columns.return_value = ""
-        mock_ainvoke.return_value = "SELECT SEVERITY, COUNT(*) FROM COMPLIANCE_VIOLATIONS GROUP BY SEVERITY"
+        mock_ainvoke.side_effect = [
+            "COMPLIANCE_VIOLATIONS",                                            # table selection
+            "SELECT SEVERITY, COUNT(*) FROM COMPLIANCE_VIOLATIONS GROUP BY SEVERITY",  # sql_agent
+        ]
         mock_db.execute_query.return_value = "[('Critical', 2), ('High', 3)]"
 
         from nodes import sql_path
@@ -181,10 +334,14 @@ class TestSqlPath:
     async def test_strips_markdown_fences(self, mock_ainvoke, mock_db, mock_catalog_fn, sample_state):
         from metrics import MetricsCatalog
         mock_catalog_fn.return_value = MetricsCatalog()
-        mock_db.get_relevant_tables.return_value = ["COMPLIANCE_VIOLATIONS"]
+        mock_db.build_table_selection_prompt.return_value = "table selection prompt"
+        mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
         mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS"
         mock_db.validate_columns.return_value = ""
-        mock_ainvoke.return_value = "```sql\nSELECT 1 FROM DUAL\n```"
+        mock_ainvoke.side_effect = [
+            "COMPLIANCE_VIOLATIONS",               # table selection
+            "```sql\nSELECT 1 FROM DUAL\n```",    # sql_agent
+        ]
         mock_db.execute_query.return_value = "[(1,)]"
 
         from nodes import sql_path
@@ -193,7 +350,6 @@ class TestSqlPath:
         called_sql = mock_db.execute_query.call_args[0][0]
         assert "```" not in called_sql
 
-
     @patch("nodes._get_metrics_catalog")
     @patch("nodes.db_connector")
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
@@ -201,17 +357,70 @@ class TestSqlPath:
         from metrics import MetricsCatalog
         mock_catalog_fn.return_value = MetricsCatalog()
         sample_state["extracted_context"] = "SUM(fine_amount + remediation_cost)"
-        mock_db.get_relevant_tables.return_value = ["COMPLIANCE_VIOLATIONS"]
+        mock_db.build_table_selection_prompt.return_value = "table selection prompt"
+        mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
         mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS"
         mock_db.validate_columns.return_value = ""
-        mock_ainvoke.return_value = "SELECT SUM(fine_amount + remediation_cost) FROM COMPLIANCE_VIOLATIONS"
+        mock_ainvoke.side_effect = [
+            "COMPLIANCE_VIOLATIONS",                                                   # table selection
+            "SELECT SUM(fine_amount + remediation_cost) FROM COMPLIANCE_VIOLATIONS",   # sql_agent
+        ]
         mock_db.execute_query.return_value = "[(2400000,)]"
 
         from nodes import sql_path
         result = await sql_path(sample_state)
-        prompt_used = mock_ainvoke.call_args[0][0]
-        assert "prior research step" in prompt_used
-        assert "SUM(fine_amount + remediation_cost)" in prompt_used
+        sql_prompt = mock_ainvoke.call_args_list[1][0][0]
+        assert "prior research step" in sql_prompt
+        assert "SUM(fine_amount + remediation_cost)" in sql_prompt
+
+    @patch("nodes.db_connector")
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_uses_resolved_metric_context(self, mock_ainvoke, mock_db, sample_state):
+        """When metric_context is in state, the prompt uses it instead of the full catalog."""
+        sample_state["metric_context"] = (
+            "Metric: Test (test@1.0)\n"
+            "Formula: (closed / total) * 100"
+        )
+        mock_db.build_table_selection_prompt.return_value = "table selection prompt"
+        mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
+        mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS"
+        mock_db.validate_columns.return_value = ""
+        mock_ainvoke.side_effect = [
+            "COMPLIANCE_VIOLATIONS",
+            "SELECT COUNT(*) FROM COMPLIANCE_VIOLATIONS",
+        ]
+        mock_db.execute_query.return_value = "[(100,)]"
+
+        from nodes import sql_path
+        result = await sql_path(sample_state)
+        sql_prompt = mock_ainvoke.call_args_list[1][0][0]
+        assert "Resolved Metric Definition (follow this formula" in sql_prompt
+        assert "(closed / total) * 100" in sql_prompt
+        assert "Known Metric Definitions:\n" not in sql_prompt
+
+    @patch("nodes._get_metrics_catalog")
+    @patch("nodes.db_connector")
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_falls_back_to_catalog_without_metric(self, mock_ainvoke, mock_db, mock_catalog_fn, sample_state):
+        """Without metric_context, the prompt includes the full catalog."""
+        from metrics import MetricsCatalog
+        mock_catalog_fn.return_value = MetricsCatalog()
+        mock_db.build_table_selection_prompt.return_value = "table selection prompt"
+        mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
+        mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS"
+        mock_db.validate_columns.return_value = ""
+        mock_ainvoke.side_effect = [
+            "COMPLIANCE_VIOLATIONS",
+            "SELECT COUNT(*) FROM COMPLIANCE_VIOLATIONS",
+        ]
+        mock_db.execute_query.return_value = "[(100,)]"
+
+        from nodes import sql_path
+        result = await sql_path(sample_state)
+        sql_prompt = mock_ainvoke.call_args_list[1][0][0]
+        assert "Known Metric Definitions:\n" in sql_prompt
+        assert "Compliance Effectiveness Score" in sql_prompt
+        assert "Resolved Metric Definition (follow this formula" not in sql_prompt
 
 
 class TestVectorRetrieval:
@@ -281,6 +490,8 @@ class TestReviewerNode:
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
     async def test_parses_score(self, mock_ainvoke, sample_state):
         sample_state["final_answer"] = "There are 2 critical violations."
+        sample_state["sql_result"] = "Query:\nSELECT...\n\nResult:\n[('Critical', 2)]"
+        sample_state["route"] = "sql_only"
         mock_ainvoke.return_value = "Score: 9.0\nDecision: APPROVED\nReason: Accurate"
         from nodes import reviewer_node
         result = await reviewer_node(sample_state)
@@ -317,6 +528,8 @@ class TestReviewerNode:
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
     async def test_dlp_clean_answer_unchanged(self, mock_ainvoke, sample_state):
         sample_state["final_answer"] = "There are 5 critical violations in Q1 2024."
+        sample_state["sql_result"] = "Query:\nSELECT...\n\nResult:\n[('Critical', 5)]"
+        sample_state["route"] = "sql_only"
         mock_ainvoke.return_value = "Score: 9.0\nDecision: APPROVED"
         from nodes import reviewer_node
         result = await reviewer_node(sample_state)

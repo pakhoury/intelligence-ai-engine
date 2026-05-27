@@ -133,7 +133,7 @@ def main():
     pg_host = os.getenv("POSTGRES_HOST", "localhost")
     pg_db = os.getenv("POSTGRES_DB", "rag_db")
 
-    connection_string = f"postgresql+psycopg2://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
+    connection_string = f"postgresql+psycopg://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
 
     vector_store = PGVector.from_documents(
         documents=chunks,

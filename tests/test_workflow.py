@@ -15,13 +15,20 @@ def mock_deps():
         patch("nodes.db_connector") as mock_db,
         patch("nodes._get_vector_store") as mock_vs_fn,
         patch("nodes._get_metrics_catalog") as mock_catalog_fn,
+        patch("nodes._get_metric_resolver") as mock_resolver_fn,
     ):
         from metrics import MetricsCatalog
         mock_catalog_fn.return_value = MetricsCatalog()
 
+        mock_resolver = MagicMock()
+        mock_resolver.resolve = AsyncMock(return_value=None)
+        mock_resolver_fn.return_value = mock_resolver
+
         # Defaults
         mock_redis.get.return_value = None
         mock_redis.set.return_value = True
+        mock_db.build_table_selection_prompt.return_value = "table selection prompt"
+        mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
         mock_db.get_relevant_tables.return_value = ["COMPLIANCE_VIOLATIONS"]
         mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS"
         mock_db.validate_columns.return_value = ""
@@ -66,6 +73,7 @@ class TestWorkflowSQLRoute:
         mock_deps["ainvoke"].side_effect = [
             "SQL_ONLY",                               # router
             "NO_CLARIFICATION_NEEDED",                # clarify
+            "COMPLIANCE_VIOLATIONS",                   # table selection
             "SELECT COUNT(*) FROM VIOLATIONS",        # sql_agent
             "There are 2 critical violations.",        # answer
             "Score: 9.0\nDecision: APPROVED",          # reviewer
@@ -114,6 +122,7 @@ class TestWorkflowParallelRoute:
         mock_deps["ainvoke"].side_effect = [
             "PARALLEL",                               # router
             "NO_CLARIFICATION_NEEDED",                # clarify
+            "COMPLIANCE_VIOLATIONS",                   # table selection
             "SELECT * FROM VIOLATIONS",               # sql_agent
             "Combined answer with data + policy",      # answer
             "Score: 8.5\nDecision: APPROVED",          # reviewer
@@ -140,6 +149,7 @@ class TestWorkflowDocsThenSqlRoute:
             "NO_CLARIFICATION_NEEDED",                                # clarify
             # vector_retrieval doesn't call LLM — it just searches
             "SUM(fine_amount + remediation_cost + audit_fees)",       # extract
+            "COMPLIANCE_VIOLATIONS",                                   # table selection
             "SELECT SUM(fine_amount) FROM COMPLIANCE_VIOLATIONS",     # sql_agent
             "The compliance cost for 2024 is $2.4M.",                 # answer
             "Score: 9.0\nDecision: APPROVED",                          # reviewer
@@ -167,6 +177,7 @@ class TestWorkflowSqlThenDocsRoute:
         mock_deps["ainvoke"].side_effect = [
             "SQL_THEN_DOCS",                                         # router
             "NO_CLARIFICATION_NEEDED",                               # clarify
+            "COMPLIANCE_VIOLATIONS",                                   # table selection
             "SELECT type, COUNT(*) FROM VIOLATIONS GROUP BY type",   # sql_agent
             "ACCESS_CONTROL",                                         # extract
             # vector_retrieval doesn't call LLM — it just searches

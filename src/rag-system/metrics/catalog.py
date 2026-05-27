@@ -3,11 +3,15 @@ from pathlib import Path
 import yaml
 
 
-CATALOG_PATH = Path(__file__).parent / "metrics_catalog.yaml"
+CATALOG_PATH = Path(__file__).parent.parent / "metrics_catalog.yaml"
 
 
 class MetricsCatalog:
-    """Loads metric definitions from YAML and provides them as LLM context."""
+    """Loads metric definitions from YAML and provides them as LLM context.
+
+    Used in the SQL generation prompt when no specific metric is resolved
+    by the metric resolver — gives the LLM the full catalog to choose from.
+    """
 
     def __init__(self, catalog_path: str | Path | None = None):
         self._path = Path(catalog_path) if catalog_path else CATALOG_PATH

@@ -8,15 +8,16 @@ Current Question: {question}
 Available Schema:
 {schema_description}
 
-Known Metric Definitions:
-{metric_definitions}
+{metric_section}
 
 Rules:
-- Understand the business intent first.
-- If the question asks about a known metric listed above, follow its formula and calculation steps precisely to generate the SQL.
+- Understand the business intent first, including any modifiers the user specifies (e.g., "top 10", "by department", "excluding...", "for Q4", "sorted by").
+- If a Resolved Metric Definition is provided above, follow its formula and calculation steps as the FOUNDATION, then ADAPT the SQL to incorporate the user's modifiers (ranking, grouping, filtering, ordering, limits, etc.).
+- If a catalog of Known Metric Definitions is provided, identify which metric best matches the question and follow its formula and calculation steps precisely.
+- Do NOT silently drop any part of the user's question. If the user asks for "top 10", the SQL MUST return ranked/ordered results limited to 10.
 - Do NOT add date/time filters (e.g., WHERE date >= ADD_MONTHS(SYSDATE, -12)) unless the user explicitly specifies a time period in their question. Query all available data by default.
 - Generate a clean and correct SELECT query only.
-- Always add this at the end: FETCH FIRST 500 ROWS ONLY
+- Always add: FETCH FIRST 500 ROWS ONLY (unless the user specifies a smaller limit like "top 10", in which case use FETCH FIRST 10 ROWS ONLY).
 - Never use SELECT *, DELETE, UPDATE, or DROP.
 - Only use the tables and columns explicitly listed in the schema above.
 - When joining tables, verify that each column belongs to the table it is referenced from. Do NOT reference a column from a table that does not list it.

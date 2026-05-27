@@ -1,0 +1,46 @@
+[project]
+name = "compliance-rag"
+version = "1.0.0"
+description = "Hybrid RAG system combining Oracle SQL and PGVector semantic search for compliance Q&A"
+requires-python = ">=3.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src/rag-system", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "S",    # flake8-bandit (security)
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "S101",  # assert in tests is fine
+    "S104",  # binding to all interfaces is intentional
+    "S603",  # subprocess calls are controlled
+    "E501",  # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S106"]  # Allow assert and hardcoded passwords in tests
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src/rag-system"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires running infrastructure (Oracle, Postgres, Redis)",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

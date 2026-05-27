@@ -2,6 +2,7 @@ metrics:
 
   compliance_effectiveness_score:
     name: "Compliance Effectiveness Score"
+    version: "1.0"
     description: >
       Measures overall compliance program effectiveness by calculating the percentage
       of compliance violations that have been successfully resolved (closed) out of
@@ -9,8 +10,36 @@ metrics:
     category: "compliance"
     unit: "%"
     formula: "(number of closed violations / total number of violations) * 100"
+    keywords:
+      - "compliance effectiveness"
+      - "compliance score"
+      - "effectiveness score"
+      - "violation resolution rate"
+      - "how effective is compliance"
+      - "compliance program effectiveness"
     tables:
       - "COMPLIANCE_VIOLATIONS"
+    sql:
+      base_table: "COMPLIANCE_VIOLATIONS"
+      select:
+        - expr: "COUNT(*)"
+          alias: "total_violations"
+        - expr: "SUM(CASE WHEN STATUS = 'Closed' THEN 1 ELSE 0 END)"
+          alias: "closed_violations"
+        - expr: "ROUND(SUM(CASE WHEN STATUS = 'Closed' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 2)"
+          alias: "effectiveness_score"
+      filters:
+        - column: "VIOLATION_DATE"
+          op: ">="
+          value: "ADD_MONTHS(SYSDATE, -{lookback_months})"
+          param: "lookback_months"
+        - column: "DEPARTMENT"
+          op: "="
+          value: "'{department}'"
+          param: "department"
+          optional: true
+      group_by: []
+      order_by: []
     steps:
       - step: 1
         action: "Count the total number of compliance violations in the time period"
@@ -56,14 +85,48 @@ metrics:
 
   violation_severity_distribution:
     name: "Violation Severity Distribution"
+    version: "1.0"
     description: >
       Breaks down compliance violations by severity level (Low, Medium, High, Critical)
       to understand the risk profile of outstanding and historical violations.
     category: "compliance"
     unit: "count"
     formula: "Count of violations grouped by SEVERITY level, optionally also broken down by STATUS"
+    keywords:
+      - "violation severity"
+      - "severity distribution"
+      - "severity breakdown"
+      - "violations by severity"
+      - "violations per severity"
+      - "how many violations per severity"
+      - "critical high medium low violations"
     tables:
       - "COMPLIANCE_VIOLATIONS"
+    sql:
+      base_table: "COMPLIANCE_VIOLATIONS"
+      select:
+        - expr: "SEVERITY"
+          alias: "severity"
+        - expr: "STATUS"
+          alias: "status"
+        - expr: "COUNT(*)"
+          alias: "violation_count"
+      filters:
+        - column: "VIOLATION_DATE"
+          op: ">="
+          value: "ADD_MONTHS(SYSDATE, -{lookback_months})"
+          param: "lookback_months"
+        - column: "DEPARTMENT"
+          op: "="
+          value: "'{department}'"
+          param: "department"
+          optional: true
+      group_by:
+        - "SEVERITY"
+        - "STATUS"
+      order_by:
+        - expr: "CASE SEVERITY WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 WHEN 'Low' THEN 4 ELSE 5 END"
+          direction: "ASC"
     steps:
       - step: 1
         action: "Count violations grouped by SEVERITY column"
@@ -100,6 +163,7 @@ metrics:
 
   audit_finding_resolution_rate:
     name: "Audit Finding Resolution Rate"
+    version: "1.0"
     description: >
       Measures the percentage of audit findings that have been resolved, providing
       insight into how effectively the organization addresses internal and external
@@ -107,8 +171,41 @@ metrics:
     category: "audit"
     unit: "%"
     formula: "(number of resolved audit findings / total audit findings) * 100"
+    keywords:
+      - "audit finding resolution"
+      - "audit resolution rate"
+      - "audit findings resolved"
+      - "how many audit findings"
+      - "audit remediation"
+      - "audit finding closure"
     tables:
       - "AUDIT_FINDINGS"
+    sql:
+      base_table: "AUDIT_FINDINGS"
+      select:
+        - expr: "COUNT(*)"
+          alias: "total_findings"
+        - expr: "SUM(CASE WHEN STATUS IN ('Closed', 'Resolved') THEN 1 ELSE 0 END)"
+          alias: "resolved_findings"
+        - expr: "ROUND(SUM(CASE WHEN STATUS IN ('Closed', 'Resolved') THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 2)"
+          alias: "resolution_rate"
+      filters:
+        - column: "FINDING_DATE"
+          op: ">="
+          value: "ADD_MONTHS(SYSDATE, -{lookback_months})"
+          param: "lookback_months"
+        - column: "AUDIT_TYPE"
+          op: "="
+          value: "'{audit_type}'"
+          param: "audit_type"
+          optional: true
+        - column: "DEPARTMENT"
+          op: "="
+          value: "'{department}'"
+          param: "department"
+          optional: true
+      group_by: []
+      order_by: []
     steps:
       - step: 1
         action: "Count all audit findings in the period"
@@ -155,6 +252,7 @@ metrics:
 
   regulatory_exposure_index:
     name: "Regulatory Exposure Index"
+    version: "1.0"
     description: >
       Calculates the total financial exposure from open compliance violations,
       aggregated by regulatory body. This metric quantifies the potential financial
@@ -162,8 +260,48 @@ metrics:
     category: "risk"
     unit: "USD"
     formula: "Sum of FINANCIAL_IMPACT for all violations where STATUS is not Closed, grouped by REGULATORY_BODY"
+    keywords:
+      - "regulatory exposure"
+      - "financial exposure"
+      - "exposure index"
+      - "regulatory risk"
+      - "financial risk by regulator"
+      - "potential penalties"
+      - "open violation exposure"
     tables:
       - "COMPLIANCE_VIOLATIONS"
+    sql:
+      base_table: "COMPLIANCE_VIOLATIONS"
+      select:
+        - expr: "REGULATORY_BODY"
+          alias: "regulatory_body"
+        - expr: "COUNT(*)"
+          alias: "open_violations"
+        - expr: "SUM(NVL(FINANCIAL_IMPACT, 0))"
+          alias: "total_exposure"
+        - expr: "MAX(NVL(FINANCIAL_IMPACT, 0))"
+          alias: "max_exposure"
+        - expr: "ROUND(AVG(NVL(FINANCIAL_IMPACT, 0)), 2)"
+          alias: "avg_exposure"
+      filters:
+        - column: "STATUS"
+          op: "!="
+          value: "'Closed'"
+          required: true
+        - column: "VIOLATION_DATE"
+          op: ">="
+          value: "ADD_MONTHS(SYSDATE, -{lookback_months})"
+          param: "lookback_months"
+        - column: "DEPARTMENT"
+          op: "="
+          value: "'{department}'"
+          param: "department"
+          optional: true
+      group_by:
+        - "REGULATORY_BODY"
+      order_by:
+        - expr: "SUM(NVL(FINANCIAL_IMPACT, 0))"
+          direction: "DESC"
     steps:
       - step: 1
         action: "Filter violations to only those that are not closed (STATUS != 'Closed')"
@@ -206,6 +344,7 @@ metrics:
 
   department_risk_score:
     name: "Department Risk Score"
+    version: "1.0"
     description: >
       Composite risk score per department calculated from the weighted combination
       of open violations (by severity), unresolved audit findings, and recorded
@@ -213,10 +352,62 @@ metrics:
     category: "risk"
     unit: "score"
     formula: "(critical_violations * 10 + high_violations * 5 + medium_violations * 2 + low_violations * 1) + (open_audit_findings * 3) + (risk_events * 4)"
+    keywords:
+      - "department risk"
+      - "risk score"
+      - "department risk score"
+      - "risk by department"
+      - "which department has highest risk"
+      - "riskiest department"
+      - "composite risk"
     tables:
       - "COMPLIANCE_VIOLATIONS"
       - "AUDIT_FINDINGS"
       - "RISK_EVENTS"
+    sql:
+      template: |
+        SELECT
+            d.DEPARTMENT,
+            NVL(v.violation_score, 0) AS violation_score,
+            NVL(a.audit_score, 0) AS audit_score,
+            NVL(r.risk_score, 0) AS risk_event_score,
+            NVL(v.violation_score, 0) + NVL(a.audit_score, 0) + NVL(r.risk_score, 0) AS composite_risk_score
+        FROM (
+            SELECT DISTINCT DEPARTMENT FROM COMPLIANCE_VIOLATIONS
+            UNION
+            SELECT DISTINCT DEPARTMENT FROM AUDIT_FINDINGS
+            UNION
+            SELECT DISTINCT DEPARTMENT FROM RISK_EVENTS
+        ) d
+        LEFT JOIN (
+            SELECT DEPARTMENT,
+                SUM(CASE WHEN SEVERITY = 'Critical' THEN 10
+                         WHEN SEVERITY = 'High' THEN 5
+                         WHEN SEVERITY = 'Medium' THEN 2
+                         WHEN SEVERITY = 'Low' THEN 1 ELSE 0 END) AS violation_score
+            FROM COMPLIANCE_VIOLATIONS
+            WHERE STATUS != 'Closed'
+              AND VIOLATION_DATE >= ADD_MONTHS(SYSDATE, -{lookback_months})
+            GROUP BY DEPARTMENT
+        ) v ON d.DEPARTMENT = v.DEPARTMENT
+        LEFT JOIN (
+            SELECT DEPARTMENT,
+                COUNT(*) * 3 AS audit_score
+            FROM AUDIT_FINDINGS
+            WHERE STATUS NOT IN ('Closed', 'Resolved')
+              AND FINDING_DATE >= ADD_MONTHS(SYSDATE, -{lookback_months})
+            GROUP BY DEPARTMENT
+        ) a ON d.DEPARTMENT = a.DEPARTMENT
+        LEFT JOIN (
+            SELECT DEPARTMENT,
+                COUNT(*) * 4 AS risk_score
+            FROM RISK_EVENTS
+            WHERE EVENT_DATE >= ADD_MONTHS(SYSDATE, -{lookback_months})
+            GROUP BY DEPARTMENT
+        ) r ON d.DEPARTMENT = r.DEPARTMENT
+        ORDER BY composite_risk_score DESC
+        FETCH FIRST 500 ROWS ONLY
+      filters: []
     steps:
       - step: 1
         action: "For each department, calculate a weighted violation score from non-closed violations"
@@ -254,6 +445,7 @@ metrics:
 
   control_coverage_ratio:
     name: "Control Coverage Ratio"
+    version: "1.0"
     description: >
       Measures what percentage of compliance requirements have at least one
       active control mapped to them. Gaps indicate areas where the organization
@@ -261,8 +453,32 @@ metrics:
     category: "governance"
     unit: "%"
     formula: "(count of distinct compliance requirements with active controls / total distinct compliance requirements) * 100"
+    keywords:
+      - "control coverage"
+      - "coverage ratio"
+      - "control gaps"
+      - "compliance requirement coverage"
+      - "how many requirements have controls"
+      - "unmapped requirements"
     tables:
       - "CONTROL_MAPPINGS"
+    sql:
+      base_table: "CONTROL_MAPPINGS"
+      select:
+        - expr: "COUNT(DISTINCT COMPLIANCE_REQUIREMENT)"
+          alias: "total_requirements"
+        - expr: "COUNT(DISTINCT CASE WHEN EFFECTIVE_DATE <= SYSDATE THEN COMPLIANCE_REQUIREMENT END)"
+          alias: "covered_requirements"
+        - expr: "ROUND(COUNT(DISTINCT CASE WHEN EFFECTIVE_DATE <= SYSDATE THEN COMPLIANCE_REQUIREMENT END) * 100.0 / NULLIF(COUNT(DISTINCT COMPLIANCE_REQUIREMENT), 0), 2)"
+          alias: "coverage_ratio"
+      filters:
+        - column: "CONTROL_OWNER_DEPT"
+          op: "="
+          value: "'{department}'"
+          param: "department"
+          optional: true
+      group_by: []
+      order_by: []
     steps:
       - step: 1
         action: "Count the total number of distinct compliance requirements"
@@ -300,6 +516,7 @@ metrics:
 
   mean_time_to_resolution:
     name: "Mean Time to Resolution"
+    version: "1.0"
     description: >
       Calculates the average number of days it takes to close a compliance
       violation from the date it was reported. This operational metric reflects
@@ -307,8 +524,53 @@ metrics:
     category: "operations"
     unit: "days"
     formula: "Average of (CLOSURE_DATE - VIOLATION_DATE) for all closed violations"
+    keywords:
+      - "mean time to resolution"
+      - "average resolution time"
+      - "mttr"
+      - "how long to close violations"
+      - "resolution days"
+      - "time to close"
+      - "violation closure time"
+      - "remediation time"
     tables:
       - "COMPLIANCE_VIOLATIONS"
+    sql:
+      base_table: "COMPLIANCE_VIOLATIONS"
+      select:
+        - expr: "COUNT(*)"
+          alias: "closed_violations"
+        - expr: "ROUND(AVG(CLOSURE_DATE - VIOLATION_DATE), 1)"
+          alias: "avg_days"
+        - expr: "MIN(CLOSURE_DATE - VIOLATION_DATE)"
+          alias: "min_days"
+        - expr: "MAX(CLOSURE_DATE - VIOLATION_DATE)"
+          alias: "max_days"
+      filters:
+        - column: "STATUS"
+          op: "="
+          value: "'Closed'"
+          required: true
+        - column: "CLOSURE_DATE"
+          op: "IS NOT"
+          value: "NULL"
+          required: true
+        - column: "VIOLATION_DATE"
+          op: ">="
+          value: "ADD_MONTHS(SYSDATE, -{lookback_months})"
+          param: "lookback_months"
+        - column: "SEVERITY"
+          op: "="
+          value: "'{severity}'"
+          param: "severity"
+          optional: true
+        - column: "DEPARTMENT"
+          op: "="
+          value: "'{department}'"
+          param: "department"
+          optional: true
+      group_by: []
+      order_by: []
     steps:
       - step: 1
         action: "Filter to only closed violations that have both VIOLATION_DATE and CLOSURE_DATE"

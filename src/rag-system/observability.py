@@ -103,6 +103,27 @@ REFLECTION_COUNT = Counter(
     registry=REGISTRY,
 )
 
+CIRCUIT_BREAKER_STATE = Gauge(
+    "rag_circuit_breaker_state",
+    "Circuit breaker state (0=closed, 1=open, 2=half_open)",
+    ["name"],
+    registry=REGISTRY,
+)
+
+CIRCUIT_BREAKER_TRIPS = Counter(
+    "rag_circuit_breaker_trips_total",
+    "Number of times circuit breaker opened",
+    ["name"],
+    registry=REGISTRY,
+)
+
+VALIDATOR_FAILURES = Counter(
+    "rag_validator_failures_total",
+    "Deterministic validator failures",
+    ["validator"],
+    registry=REGISTRY,
+)
+
 LLM_COST = Counter(
     "rag_llm_cost_usd",
     "Estimated LLM cost in USD",

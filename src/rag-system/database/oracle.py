@@ -50,39 +50,27 @@ class OracleConnector(DatabaseConnector):
             self.catalog = json.load(f)
 
     def get_relevant_tables(self, question: str) -> List[str]:
-        """Use LLM to intelligently select tables from catalog."""
-        if not self.llm:
-            return self._keyword_fallback(question)
+        """Keyword-based table selection (no LLM call)."""
+        return self._keyword_fallback(question)
 
+    def build_table_selection_prompt(self, question: str) -> str:
+        """Build a prompt for LLM-based table selection."""
         catalog_summary = self._get_catalog_summary()
+        return (
+            f"You are a senior Oracle database expert.\n\n"
+            f"User Question: {question}\n\n"
+            f"Available Tables and their business meaning:\n"
+            f"{catalog_summary}\n\n"
+            f"Select ONLY the tables that are needed to answer this question.\n"
+            f"Return maximum 5 tables.\n"
+            f"Return only table names separated by commas.\n\n"
+            f"Example output: COMPLIANCE_VIOLATIONS, CONTROL_MAPPINGS, RISK_EVENTS"
+        )
 
-        prompt = f"""You are a senior Oracle database expert.
-
-User Question: {question}
-
-Available Tables and their business meaning:
-{catalog_summary}
-
-Select ONLY the tables that are needed to answer this question.
-Return maximum 5 tables.
-Return only table names separated by commas.
-
-Example output: COMPLIANCE_VIOLATIONS, CONTROL_MAPPINGS, RISK_EVENTS"""
-
-        try:
-            response = self.llm.invoke(prompt)
-            tables = [t.strip().upper() for t in response.content.split(",") if t.strip()]
-            logger.info(
-                f"LLM selected tables: {tables}",
-                extra={"node": "sql_path", "sql": f"tables={tables}"},
-            )
-            return tables[:5]
-        except Exception as e:
-            logger.warning(
-                f"LLM table selection failed: {e}",
-                extra={"node": "sql_path", "error": str(e)},
-            )
-            return self._keyword_fallback(question)
+    def parse_table_selection(self, llm_response: str) -> List[str]:
+        """Parse table names from an LLM response."""
+        tables = [t.strip().upper() for t in llm_response.split(",") if t.strip()]
+        return tables[:5]
 
     def _get_catalog_summary(self) -> str:
         """Create rich summary for LLM."""

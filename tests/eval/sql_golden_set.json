@@ -1,0 +1,131 @@
+{
+  "description": "Golden SQL set — verifies that compiled metrics produce the exact expected SQL. If any entry fails, it means the compiler or metric definition changed in a way that breaks determinism.",
+  "cases": [
+    {
+      "id": "ces_default",
+      "question": "What is the compliance effectiveness score?",
+      "expected_metric": "compliance_effectiveness_score",
+      "params": {},
+      "expected_sql_contains": [
+        "SELECT",
+        "COUNT(*)",
+        "CASE WHEN STATUS = 'Closed' THEN 1 ELSE 0 END",
+        "NULLIF(COUNT(*), 0)",
+        "FROM COMPLIANCE_VIOLATIONS",
+        "ADD_MONTHS(SYSDATE, -12)",
+        "FETCH FIRST 500 ROWS ONLY"
+      ],
+      "expected_sql_not_contains": [
+        "DEPARTMENT"
+      ]
+    },
+    {
+      "id": "ces_with_department",
+      "question": "compliance effectiveness score for the Operations department",
+      "expected_metric": "compliance_effectiveness_score",
+      "params": {"department": "Operations"},
+      "expected_sql_contains": [
+        "DEPARTMENT = 'Operations'"
+      ]
+    },
+    {
+      "id": "ces_6_months",
+      "question": "compliance effectiveness score for the last 6 months",
+      "expected_metric": "compliance_effectiveness_score",
+      "params": {"lookback_months": "6"},
+      "expected_sql_contains": [
+        "ADD_MONTHS(SYSDATE, -6)"
+      ],
+      "expected_sql_not_contains": [
+        "ADD_MONTHS(SYSDATE, -12)"
+      ]
+    },
+    {
+      "id": "severity_dist_default",
+      "question": "Show violation severity breakdown",
+      "expected_metric": "violation_severity_distribution",
+      "params": {},
+      "expected_sql_contains": [
+        "SEVERITY",
+        "STATUS",
+        "COUNT(*)",
+        "GROUP BY",
+        "ORDER BY",
+        "CASE SEVERITY WHEN 'Critical' THEN 1"
+      ]
+    },
+    {
+      "id": "audit_resolution_default",
+      "question": "What is the audit finding resolution rate?",
+      "expected_metric": "audit_finding_resolution_rate",
+      "params": {},
+      "expected_sql_contains": [
+        "AUDIT_FINDINGS",
+        "Closed",
+        "Resolved",
+        "NULLIF"
+      ]
+    },
+    {
+      "id": "reg_exposure_default",
+      "question": "What is our regulatory exposure?",
+      "expected_metric": "regulatory_exposure_index",
+      "params": {},
+      "expected_sql_contains": [
+        "STATUS != 'Closed'",
+        "REGULATORY_BODY",
+        "SUM(NVL(FINANCIAL_IMPACT, 0))",
+        "ORDER BY",
+        "DESC"
+      ]
+    },
+    {
+      "id": "dept_risk_default",
+      "question": "Which department has the highest risk score?",
+      "expected_metric": "department_risk_score",
+      "params": {},
+      "expected_sql_contains": [
+        "composite_risk_score",
+        "COMPLIANCE_VIOLATIONS",
+        "AUDIT_FINDINGS",
+        "RISK_EVENTS",
+        "Critical",
+        "ORDER BY composite_risk_score DESC"
+      ]
+    },
+    {
+      "id": "control_coverage_default",
+      "question": "Show control coverage ratio",
+      "expected_metric": "control_coverage_ratio",
+      "params": {},
+      "expected_sql_contains": [
+        "CONTROL_MAPPINGS",
+        "COMPLIANCE_REQUIREMENT",
+        "EFFECTIVE_DATE",
+        "NULLIF"
+      ]
+    },
+    {
+      "id": "mttr_default",
+      "question": "What is the MTTR?",
+      "expected_metric": "mean_time_to_resolution",
+      "params": {},
+      "expected_sql_contains": [
+        "STATUS = 'Closed'",
+        "CLOSURE_DATE IS NOT NULL",
+        "AVG(CLOSURE_DATE - VIOLATION_DATE)",
+        "MIN(CLOSURE_DATE - VIOLATION_DATE)",
+        "MAX(CLOSURE_DATE - VIOLATION_DATE)"
+      ]
+    },
+    {
+      "id": "mttr_critical_severity",
+      "question": "mean time to resolution for critical violations",
+      "expected_metric": "mean_time_to_resolution",
+      "params": {"severity": "Critical"},
+      "expected_sql_contains": [
+        "SEVERITY = 'Critical'"
+      ]
+    }
+  ]
+}
