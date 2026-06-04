@@ -10,15 +10,38 @@ from typing import Dict, List, Set, Tuple
 
 from .registry import MetricDefinition, MetricRegistry
 
-CATALOG_PATH = Path(__file__).parent.parent / "catalog.json"
+CATALOG_DIR = Path(__file__).parent.parent / "catalog"
+LEGACY_CATALOG_PATH = Path(__file__).parent.parent / "catalog.json"
 
 
-def _load_catalog_columns(catalog_path: Path = CATALOG_PATH) -> Dict[str, Set[str]]:
-    """Load table→columns mapping from the database catalog."""
-    with open(catalog_path, "r", encoding="utf-8") as f:
-        catalog = json.load(f)
+def _load_catalog_columns(catalog_path: Path = CATALOG_DIR) -> Dict[str, Set[str]]:
+    """Load table→columns mapping from the database catalog.
 
+    Supports both the new per-table catalog directory structure
+    and the legacy single-file catalog.json.
+    """
     table_columns: Dict[str, Set[str]] = {}
+
+    if catalog_path.is_dir():
+        meta_file = catalog_path / "database_metadata.json"
+        if not meta_file.exists():
+            return table_columns
+        with open(meta_file, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        for schema_data in metadata.get("schemas", {}).values():
+            for table_name, entry in schema_data.get("tables", {}).items():
+                table_file = catalog_path / entry.get("file", "")
+                if table_file.exists():
+                    with open(table_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    table_columns[table_name] = set(data.get("columns", {}).keys())
+        return table_columns
+
+    resolved = catalog_path if catalog_path.is_file() else LEGACY_CATALOG_PATH
+    if not resolved.exists():
+        return table_columns
+    with open(resolved, "r", encoding="utf-8") as f:
+        catalog = json.load(f)
     for schema_data in catalog.get("schemas", {}).values():
         for table_name, info in schema_data.get("tables", {}).items():
             table_columns[table_name] = set(info.get("columns", {}).keys())
@@ -27,7 +50,7 @@ def _load_catalog_columns(catalog_path: Path = CATALOG_PATH) -> Dict[str, Set[st
 
 def validate_metric(
     metric: MetricDefinition,
-    catalog_path: Path = CATALOG_PATH,
+    catalog_path: Path = CATALOG_DIR,
 ) -> Tuple[bool, List[str]]:
     """Validate a single metric definition.
 
@@ -85,7 +108,7 @@ def validate_metric(
 
 def validate_catalog(
     registry: MetricRegistry,
-    catalog_path: Path = CATALOG_PATH,
+    catalog_path: Path = CATALOG_DIR,
 ) -> Tuple[bool, List[str]]:
     """Validate all metrics in a registry."""
     all_errors: List[str] = []

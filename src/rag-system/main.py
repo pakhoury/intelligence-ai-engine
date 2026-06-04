@@ -139,15 +139,44 @@ async def query(
             answer = result.get("final_answer", "Sorry, I could not generate an answer.")
 
             if not result.get("cache_hit"):
-                history.append({"question": question, "answer": answer})
+                history_entry = {
+                    "question": question,
+                    "answer": answer,
+                }
+                if result.get("resolved_metric"):
+                    history_entry["resolved_metric"] = result["resolved_metric"]
+                    history_entry["metric_version"] = result.get("metric_version", "")
+                if result.get("route"):
+                    history_entry["route"] = result["route"]
+                sql_result = result.get("sql_result", "")
+                if sql_result and not sql_result.startswith(("Error", "N/A")):
+                    if "\n\nResult:\n" in sql_result:
+                        history_entry["data_summary"] = sql_result.split("\n\nResult:\n")[1][:300]
+                    else:
+                        history_entry["data_summary"] = sql_result[:300]
+                history.append(history_entry)
                 await _save_history(session_id, history)
 
-            return {
+            interpreted_as = result.get("question", question)
+            latency_ms = round((time.perf_counter() - start) * 1000, 1) if 'start' in dir() else None
+
+            response = {
                 "answer": answer,
                 "cache_hit": result.get("cache_hit", False),
                 "session_id": session_id,
                 "trace_id": trace_id_var.get("no-trace"),
+                "metadata": {
+                    "route": result.get("route"),
+                    "resolved_metric": result.get("resolved_metric"),
+                    "metric_version": result.get("metric_version"),
+                    "compiled": result.get("compiled_metric", False),
+                    "confidence": result.get("confidence", "unknown"),
+                    "review_score": result.get("review_score"),
+                },
             }
+            if interpreted_as.lower() != question.lower():
+                response["interpreted_as"] = interpreted_as
+            return response
     except asyncio.TimeoutError:
         REQUEST_COUNT.labels(status="error").inc()
         logger.error(

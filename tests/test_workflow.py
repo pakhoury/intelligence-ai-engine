@@ -14,12 +14,8 @@ def mock_deps():
         patch("nodes._ainvoke_llm", new_callable=AsyncMock) as mock_ainvoke,
         patch("nodes.db_connector") as mock_db,
         patch("nodes._get_vector_store") as mock_vs_fn,
-        patch("nodes._get_metrics_catalog") as mock_catalog_fn,
         patch("nodes._get_metric_resolver") as mock_resolver_fn,
     ):
-        from metrics import MetricsCatalog
-        mock_catalog_fn.return_value = MetricsCatalog()
-
         mock_resolver = MagicMock()
         mock_resolver.resolve = AsyncMock(return_value=None)
         mock_resolver_fn.return_value = mock_resolver

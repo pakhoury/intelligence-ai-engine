@@ -3,14 +3,15 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from typing import TypedDict
 from nodes import (
-    cache_check, router_node, clarification_node, extract_node, sql_path,
-    vector_retrieval, answer_generator, reviewer_node, cache_write,
-    metric_resolver_node,
+    cache_check, context_resolver, router_node, clarification_node,
+    extract_node, sql_path, vector_retrieval, answer_generator,
+    reviewer_node, cache_write, metric_resolver_node,
 )
 from observability import logger
 
 class AgentState(TypedDict, total=False):
     question: str
+    original_question: str
     session_id: str
     conversation_history: list
     cache_hit: bool
@@ -26,12 +27,16 @@ class AgentState(TypedDict, total=False):
     resolved_metric: str
     metric_version: str
     metric_context: str
+    metric_params: dict
+    compiled_metric: bool
+    confidence: str
 
 MAX_REFLECTION_ATTEMPTS = 2
 
 workflow = StateGraph(AgentState)
 
 workflow.add_node("cache_check", cache_check)
+workflow.add_node("context_resolver", context_resolver)
 workflow.add_node("router", router_node)
 workflow.add_node("clarify", clarification_node)
 workflow.add_node("metric_resolver", metric_resolver_node)
@@ -44,12 +49,14 @@ workflow.add_node("cache_write", cache_write)
 
 workflow.set_entry_point("cache_check")
 
-# Cache hit → END, miss → router
+# Cache hit → END, miss → context_resolver → router
 workflow.add_conditional_edges(
     "cache_check",
-    lambda s: END if s.get("cache_hit") else "router",
-    {END: END, "router": "router"}
+    lambda s: END if s.get("cache_hit") else "context_resolver",
+    {END: END, "context_resolver": "context_resolver"}
 )
+
+workflow.add_edge("context_resolver", "router")
 
 workflow.add_edge("router", "clarify")
 
@@ -150,12 +157,17 @@ workflow.add_edge("cache_write", END)
 
 
 def _create_checkpointer():
-    """Create persistent PostgreSQL checkpointer, falling back to in-memory."""
+    """Create persistent PostgreSQL checkpointer.
+
+    In production (ENVIRONMENT != 'development'), failure to connect is fatal —
+    audit trail loss is unacceptable. In dev, falls back to in-memory.
+    """
     pg_user = os.getenv("POSTGRES_USER", "postgres")
     pg_password = os.getenv("POSTGRES_PASSWORD", "postgres")
     pg_host = os.getenv("POSTGRES_HOST", "localhost")
     pg_db = os.getenv("POSTGRES_DB", "rag_db")
     conn_string = f"postgresql://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
+    is_dev = os.getenv("ENVIRONMENT", "development") == "development"
 
     try:
         import psycopg
@@ -167,6 +179,12 @@ def _create_checkpointer():
         logger.info("Using PostgreSQL checkpointer for persistent audit trail")
         return checkpointer
     except Exception as e:
+        if not is_dev:
+            raise RuntimeError(
+                f"PostgreSQL checkpointer required in production but unavailable: {e}. "
+                f"Audit trail cannot be persisted. Fix the connection or set "
+                f"ENVIRONMENT=development to allow in-memory fallback."
+            ) from e
         logger.warning(
             f"PostgreSQL checkpointer unavailable ({e}), falling back to in-memory. "
             f"Audit trail will NOT survive restarts.",

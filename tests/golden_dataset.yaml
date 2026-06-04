@@ -118,3 +118,284 @@ cases:
       sql_result: "Error: SQL blocked by safety validator"
       answer_response: "I cannot execute this query as it contains unsafe operations."
       reviewer_response: "Score: 7.0\nDecision: APPROVED\nReason: Correctly refused unsafe query."
+
+  # ── Additional metric queries ─────────────────────────────────────
+
+  - id: audit_resolution_rate
+    question: "What is the audit finding resolution rate?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "%"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["AUDIT_FINDINGS"]
+      sql_schema: "Table: AUDIT_FINDINGS\nColumns: FINDING_ID, AUDIT_TYPE, STATUS"
+      sql_response: "SELECT COUNT(*) AS total, SUM(CASE WHEN STATUS IN ('Closed','Resolved') THEN 1 ELSE 0 END) AS resolved FROM AUDIT_FINDINGS"
+      sql_result: "[(50, 38)]"
+      answer_response: "The audit finding resolution rate is 76% — 38 out of 50 findings have been resolved."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: department_risk_composite
+    question: "Which department has the highest risk score?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "risk"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS", "AUDIT_FINDINGS", "RISK_EVENTS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nTable: AUDIT_FINDINGS\nTable: RISK_EVENTS"
+      sql_response: "SELECT DEPARTMENT, composite_risk_score FROM risk_query ORDER BY composite_risk_score DESC FETCH FIRST 5 ROWS ONLY"
+      sql_result: "[('Operations', 87), ('Legal', 52), ('IT', 34)]"
+      answer_response: "Operations has the highest composite risk score at 87, followed by Legal (52) and IT (34)."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: regulatory_exposure
+    question: "What is our regulatory exposure by regulator?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "exposure"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: REGULATORY_BODY, FINANCIAL_IMPACT, STATUS"
+      sql_response: "SELECT REGULATORY_BODY, SUM(FINANCIAL_IMPACT) FROM COMPLIANCE_VIOLATIONS WHERE STATUS != 'Closed' GROUP BY REGULATORY_BODY"
+      sql_result: "[('RBI', 450000), ('SEBI', 120000)]"
+      answer_response: "Regulatory exposure: RBI has $450,000 and SEBI has $120,000 in open violation exposure."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: control_coverage
+    question: "What is the control coverage ratio?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "%"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["CONTROL_MAPPINGS"]
+      sql_schema: "Table: CONTROL_MAPPINGS\nColumns: CONTROL_ID, COMPLIANCE_REQUIREMENT, EFFECTIVE_DATE"
+      sql_response: "SELECT COUNT(DISTINCT COMPLIANCE_REQUIREMENT) AS total, COUNT(DISTINCT CASE WHEN EFFECTIVE_DATE <= SYSDATE THEN COMPLIANCE_REQUIREMENT END) AS covered FROM CONTROL_MAPPINGS"
+      sql_result: "[(20, 18)]"
+      answer_response: "The control coverage ratio is 90% — 18 out of 20 compliance requirements have active controls."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: mttr_basic
+    question: "What is the mean time to resolution for violations?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "days"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: STATUS, VIOLATION_DATE, CLOSURE_DATE"
+      sql_response: "SELECT ROUND(AVG(CLOSURE_DATE - VIOLATION_DATE), 1) AS avg_days FROM COMPLIANCE_VIOLATIONS WHERE STATUS = 'Closed'"
+      sql_result: "[(32.5,)]"
+      answer_response: "The mean time to resolution for closed violations is 32.5 days."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: mttr_by_severity
+    question: "What is the average resolution time for critical violations?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "critical"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: STATUS, SEVERITY, VIOLATION_DATE, CLOSURE_DATE"
+      sql_response: "SELECT ROUND(AVG(CLOSURE_DATE - VIOLATION_DATE), 1) FROM COMPLIANCE_VIOLATIONS WHERE STATUS = 'Closed' AND SEVERITY = 'Critical'"
+      sql_result: "[(15.2,)]"
+      answer_response: "Critical violations have an average resolution time of 15.2 days, which is rated as Excellent."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  # ── Parallel and hybrid queries ───────────────────────────────────
+
+  - id: parallel_violations_and_framework
+    question: "Show all open critical violations and summarize our risk framework"
+    expected_route: parallel
+    expected_answer_contains:
+      - "critical"
+    mock_data:
+      router_response: "PARALLEL"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: VIOLATION_ID, SEVERITY, STATUS, DEPARTMENT"
+      sql_response: "SELECT VIOLATION_ID, DEPARTMENT FROM COMPLIANCE_VIOLATIONS WHERE SEVERITY='Critical' AND STATUS='Open'"
+      sql_result: "[('V-101', 'Operations'), ('V-203', 'Legal')]"
+      vector_docs:
+        - title: "Risk Framework v2.0"
+          content: "The risk framework categorizes events by operational, credit, and market risk with quarterly assessments."
+      answer_response: "There are 2 open critical violations — V-101 in Operations and V-203 in Legal. Our risk framework categorizes events by operational, credit, and market risk with quarterly assessments."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: docs_then_sql_cost_by_dept
+    question: "Calculate the compliance cost for the Operations department"
+    expected_route: docs_then_sql
+    expected_answer_contains:
+      - "Operations"
+    mock_data:
+      router_response: "DOCS_THEN_SQL"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      vector_docs:
+        - title: "Cost Methodology"
+          content: "Compliance cost = SUM(FINANCIAL_IMPACT) for violations in the department."
+      extract_response: "SUM(FINANCIAL_IMPACT) WHERE DEPARTMENT = 'Operations'"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: DEPARTMENT, FINANCIAL_IMPACT"
+      sql_response: "SELECT SUM(FINANCIAL_IMPACT) FROM COMPLIANCE_VIOLATIONS WHERE DEPARTMENT = 'Operations'"
+      sql_result: "[(870000,)]"
+      answer_response: "The total compliance cost for the Operations department is $870,000, calculated as the sum of financial impact from all violations."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  # ── Edge cases ────────────────────────────────────────────────────
+
+  - id: empty_result_set
+    question: "How many critical violations are there in the Finance department?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "0"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: SEVERITY, STATUS, DEPARTMENT"
+      sql_response: "SELECT COUNT(*) FROM COMPLIANCE_VIOLATIONS WHERE SEVERITY='Critical' AND DEPARTMENT='Finance'"
+      sql_result: "[(0,)]"
+      answer_response: "There are 0 critical violations in the Finance department."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: vague_question
+    question: "What's happening?"
+    expected_route: parallel
+    needs_clarification: true
+    mock_data:
+      router_response: "PARALLEL"
+      clarify_response: "Could you please specify what you'd like to know about? For example, compliance status, recent violations, or audit findings?"
+
+  - id: top_n_query
+    question: "Show me the top 5 departments by number of violations"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "department"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: DEPARTMENT, VIOLATION_ID"
+      sql_response: "SELECT DEPARTMENT, COUNT(*) AS cnt FROM COMPLIANCE_VIOLATIONS GROUP BY DEPARTMENT ORDER BY cnt DESC FETCH FIRST 5 ROWS ONLY"
+      sql_result: "[('Operations', 47), ('Legal', 32), ('IT', 28), ('HR', 15), ('Finance', 8)]"
+      answer_response: "Top 5 departments by violations: Operations (47), Legal (32), IT (28), HR (15), Finance (8)."
+      reviewer_response: "Score: 9.5\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: multi_table_join_question
+    question: "Which departments have both open violations and unresolved audit findings?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "Operations"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS", "AUDIT_FINDINGS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: DEPARTMENT, STATUS\nTable: AUDIT_FINDINGS\nColumns: DEPARTMENT, STATUS"
+      sql_response: "SELECT DISTINCT v.DEPARTMENT FROM COMPLIANCE_VIOLATIONS v INNER JOIN AUDIT_FINDINGS a ON v.DEPARTMENT = a.DEPARTMENT WHERE v.STATUS != 'Closed' AND a.STATUS NOT IN ('Closed','Resolved')"
+      sql_result: "[('Operations',), ('Legal',)]"
+      answer_response: "Operations and Legal both have open compliance violations and unresolved audit findings, indicating overlapping risk."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: policy_comparison
+    question: "What are the differences between our AML and KYC policies?"
+    expected_route: docs_only
+    expected_answer_contains:
+      - "AML"
+      - "KYC"
+    mock_data:
+      router_response: "DOCS_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      vector_docs:
+        - title: "AML Policy"
+          content: "AML policy focuses on monitoring suspicious transactions, filing SARs, and maintaining transaction records for 5 years."
+        - title: "KYC Policy"
+          content: "KYC policy requires customer identity verification, risk categorization (low/medium/high), and periodic reviews."
+      answer_response: "AML policy focuses on transaction monitoring and SAR filing with 5-year record retention. KYC policy requires identity verification and risk-based customer categorization with periodic reviews."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: trend_analysis
+    question: "How has the number of violations changed over the last 4 quarters?"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "Q"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: VIOLATION_DATE, VIOLATION_ID"
+      sql_response: "SELECT TO_CHAR(VIOLATION_DATE,'YYYY-Q') AS quarter, COUNT(*) FROM COMPLIANCE_VIOLATIONS GROUP BY TO_CHAR(VIOLATION_DATE,'YYYY-Q') ORDER BY quarter DESC FETCH FIRST 4 ROWS ONLY"
+      sql_result: "[('2024-4', 18), ('2024-3', 25), ('2024-2', 30), ('2024-1', 48)]"
+      answer_response: "Violations have been declining: Q1 2024 (48), Q2 (30), Q3 (25), Q4 (18) — a 62.5% reduction over 4 quarters."
+      reviewer_response: "Score: 9.5\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: sql_injection_comment
+    question: "Show violations -- DROP TABLE"
+    expected_route: sql_only
+    expected_sql_blocked: true
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS"
+      sql_response: "SELECT * FROM COMPLIANCE_VIOLATIONS -- DROP TABLE"
+      sql_result: "Error: SQL blocked"
+      answer_response: "Cannot execute query with unsafe patterns."
+      reviewer_response: "Score: 7.0\nDecision: APPROVED"
+
+  - id: risk_events_by_category
+    question: "Break down risk events by category"
+    expected_route: sql_only
+    expected_answer_contains:
+      - "risk"
+    mock_data:
+      router_response: "SQL_ONLY"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["RISK_EVENTS"]
+      sql_schema: "Table: RISK_EVENTS\nColumns: RISK_CATEGORY, EVENT_ID, LOSS_AMOUNT"
+      sql_response: "SELECT RISK_CATEGORY, COUNT(*), SUM(LOSS_AMOUNT) FROM RISK_EVENTS GROUP BY RISK_CATEGORY"
+      sql_result: "[('Operational', 25, 500000), ('Credit', 10, 2000000), ('Market', 5, 150000)]"
+      answer_response: "Risk events by category: Operational (25 events, $500K loss), Credit (10 events, $2M loss), Market (5 events, $150K loss)."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0
+
+  - id: sql_then_docs_violation_policy
+    question: "What are the open high-severity violations and what remediation steps does our policy require?"
+    expected_route: sql_then_docs
+    expected_answer_contains:
+      - "remediation"
+    mock_data:
+      router_response: "SQL_THEN_DOCS"
+      clarify_response: "NO_CLARIFICATION_NEEDED"
+      sql_tables: ["COMPLIANCE_VIOLATIONS"]
+      sql_schema: "Table: COMPLIANCE_VIOLATIONS\nColumns: VIOLATION_ID, VIOLATION_TYPE, SEVERITY, STATUS"
+      sql_response: "SELECT VIOLATION_ID, VIOLATION_TYPE FROM COMPLIANCE_VIOLATIONS WHERE SEVERITY='High' AND STATUS='Open'"
+      sql_result: "[('V-301', 'DATA_PRIVACY'), ('V-302', 'AML')]"
+      extract_response: "DATA_PRIVACY, AML"
+      vector_docs:
+        - title: "Remediation SOP"
+          content: "Data privacy violations require immediate notification to DPO within 24 hours. AML violations require filing a SAR and enhanced monitoring."
+      answer_response: "There are 2 open high-severity violations: V-301 (Data Privacy) — requires DPO notification within 24 hours; V-302 (AML) — requires SAR filing and enhanced monitoring per remediation SOP."
+      reviewer_response: "Score: 9.0\nDecision: APPROVED"
+    min_review_score: 7.0

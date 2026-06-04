@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import os
 import re
-from config import llm, db_connector, redis_client, load_prompt
+from config import llm, llm_fallback, db_connector, redis_client, load_prompt
 from datetime import timedelta
 from typing import Dict, Optional
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -11,31 +11,30 @@ from observability import logger, NodeTimer, CACHE_OPS, ROUTE_COUNT, REVIEW_SCOR
 from security import sanitize_for_prompt, redact_pii, dlp_scan
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from llm_ops import context_manager
-from metrics import MetricsCatalog
 from metrics.loader import load_metrics_catalog
 from metrics.llm_resolver import LLMMetricResolver
 from metrics.registry import MetricDefinition
 from circuit_breaker import llm_circuit_breaker, CircuitBreakerOpen
 from validators import validate_sql_safety, run_all_validators
+from metrics.compiler import MetricCompiler
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-_metrics_catalog: Optional[MetricsCatalog] = None
 _metric_resolver: Optional[LLMMetricResolver] = None
+_metric_registry = None
 
 
-def _get_metrics_catalog() -> MetricsCatalog:
-    global _metrics_catalog
-    if _metrics_catalog is None:
-        _metrics_catalog = MetricsCatalog()
-    return _metrics_catalog
+def _get_metric_registry():
+    global _metric_registry
+    if _metric_registry is None:
+        _metric_registry = load_metrics_catalog()
+    return _metric_registry
 
 
 def _get_metric_resolver() -> LLMMetricResolver:
     global _metric_resolver
     if _metric_resolver is None:
-        registry = load_metrics_catalog()
-        _metric_resolver = LLMMetricResolver(registry, _ainvoke_llm, load_prompt)
+        _metric_resolver = LLMMetricResolver(_get_metric_registry(), _ainvoke_llm, load_prompt)
     return _metric_resolver
 
 
@@ -75,17 +74,40 @@ def _format_history(state: Dict) -> str:
     lines = []
     for turn in history[-5:]:
         q = sanitize_for_prompt(turn.get("question", ""), max_length=200)
-        a = sanitize_for_prompt(turn.get("answer", ""), max_length=300)
+        a = sanitize_for_prompt(turn.get("answer", ""), max_length=500)
         lines.append(f"User: {q}")
         lines.append(f"Assistant: {a}")
+        context_parts = []
+        if turn.get("resolved_metric"):
+            version = turn.get("metric_version", "")
+            mid = turn["resolved_metric"]
+            context_parts.append(f"Metric: {mid}@{version}" if version else f"Metric: {mid}")
+        if turn.get("route"):
+            context_parts.append(f"Route: {turn['route']}")
+        if turn.get("data_summary"):
+            summary = sanitize_for_prompt(turn["data_summary"], max_length=200)
+            context_parts.append(f"Data: {summary}")
+        if context_parts:
+            lines.append(f"[{' | '.join(context_parts)}]")
     return "\n".join(lines)
 
 
-def _cache_key(question: str) -> str:
-    """Normalize question into a stable cache key."""
+def _cache_key(question: str, resolved_metric: str = "", metric_params: dict = None) -> str:
+    """Build a stable cache key from question + metric context.
+
+    Includes resolved metric and params so that the same question text with
+    different parameters (e.g. different departments) doesn't collide.
+    """
     normalized = question.strip().lower()
     normalized = re.sub(r"\s+", " ", normalized)
-    return f"rag:answer:{hashlib.sha256(normalized.encode()).hexdigest()[:16]}"
+    parts = [normalized]
+    if resolved_metric:
+        parts.append(f"m:{resolved_metric}")
+    if metric_params:
+        sorted_params = sorted(metric_params.items())
+        parts.append(f"p:{sorted_params}")
+    composite = "|".join(parts)
+    return f"rag:answer:{hashlib.sha256(composite.encode()).hexdigest()[:16]}"
 
 
 def _parse_review_score(content: str) -> float:
@@ -106,13 +128,18 @@ def _parse_review_score(content: str) -> float:
     reraise=True,
 )
 async def _ainvoke_llm(prompt: str) -> str:
-    llm_circuit_breaker.before_call()
+    try:
+        llm_circuit_breaker.before_call()
+    except CircuitBreakerOpen:
+        logger.warning("Circuit breaker open, trying fallback chain", extra={"node": "llm"})
+        result = await asyncio.to_thread(llm_fallback.invoke_with_fallback, prompt)
+        if result is not None:
+            return result
+        raise
     try:
         response = await llm.ainvoke(prompt)
         llm_circuit_breaker.record_success()
         return response.content
-    except CircuitBreakerOpen:
-        raise
     except Exception as e:
         llm_circuit_breaker.record_failure()
         raise
@@ -133,6 +160,57 @@ async def cache_check(state: Dict):
         logger.info("Cache MISS", extra={"node": "cache_check", "cache_hit": False})
         CACHE_OPS.labels(result="miss").inc()
         return {"cache_hit": False}
+
+
+def _state_cache_key(state: Dict) -> str:
+    """Build enriched cache key from full pipeline state."""
+    return _cache_key(
+        state["question"],
+        resolved_metric=state.get("resolved_metric", ""),
+        metric_params=state.get("metric_params"),
+    )
+
+
+async def context_resolver(state: Dict):
+    """Rewrite follow-up questions into standalone queries using conversation history.
+
+    On first turn (no history), passes through unchanged. On follow-ups, the LLM
+    resolves references like "that", "those", "break it down" into a self-contained
+    question that downstream nodes can process without needing conversation context.
+    """
+    with NodeTimer("context_resolver"):
+        original = state["question"]
+        history = state.get("conversation_history", [])
+
+        if not history:
+            return {"original_question": original}
+
+        formatted = _format_history(state)
+        prompt = load_prompt("context_resolver.txt").format(
+            question=original,
+            conversation_history=formatted,
+        )
+        try:
+            rewritten = (await _ainvoke_llm(prompt)).strip()
+            if not rewritten:
+                rewritten = original
+
+            if rewritten.lower() != original.lower():
+                logger.info(
+                    f"Question rewritten for context",
+                    extra={
+                        "node": "context_resolver",
+                        "original": original,
+                        "rewritten": rewritten,
+                    },
+                )
+            return {"original_question": original, "question": rewritten}
+        except Exception as e:
+            logger.warning(
+                f"Context resolution failed, using original: {e}",
+                extra={"node": "context_resolver", "error": str(e)},
+            )
+            return {"original_question": original}
 
 
 VALID_ROUTES = {"sql_only", "docs_only", "docs_then_sql", "sql_then_docs", "parallel"}
@@ -301,6 +379,7 @@ async def metric_resolver_node(state: Dict):
             "resolved_metric": resolved.metric.metric_id,
             "metric_version": resolved.metric.version,
             "metric_context": metric_context,
+            "metric_params": resolved.extracted_params,
         }
 
 
@@ -316,9 +395,59 @@ def _strip_sql_fences(sql: str) -> str:
 MAX_SQL_RETRIES = 2
 
 
+_compiler = MetricCompiler()
+
+
+async def _try_compiled_metric(state: Dict) -> Optional[Dict]:
+    """Try deterministic metric compilation. Returns result dict or None to fall through to LLM."""
+    resolved_metric_id = state.get("resolved_metric")
+    if not resolved_metric_id:
+        return None
+
+    metric = _get_metric_registry().get(resolved_metric_id)
+    if not metric or not metric.is_compilable:
+        return None
+
+    params = state.get("metric_params") or {}
+
+    compiled = _compiler.compile(metric, params)
+    if not compiled:
+        return None
+
+    logger.info(
+        f"Compiled metric SQL deterministically ({compiled.compilation_mode}): {compiled.sql}",
+        extra={
+            "node": "sql_path",
+            "metric": compiled.metric_id,
+            "version": compiled.version,
+            "mode": compiled.compilation_mode,
+            "sql": compiled.sql,
+        },
+    )
+
+    sql_result = await asyncio.to_thread(db_connector.execute_query, compiled.sql)
+
+    if sql_result.startswith(("Execution Error:", "Error:")):
+        logger.warning(
+            f"Compiled SQL execution failed, falling back to LLM: {sql_result}",
+            extra={"node": "sql_path", "error": sql_result},
+        )
+        return None
+
+    sql_result = redact_pii(sql_result)
+    return {
+        "sql_result": f"Query:\n{compiled.sql}\n\nResult:\n{sql_result}",
+        "compiled_metric": True,
+    }
+
+
 async def sql_path(state: Dict):
     with NodeTimer("sql_path"):
         question = state["question"]
+
+        compiled_result = await _try_compiled_metric(state)
+        if compiled_result is not None:
+            return compiled_result
 
         logger.info(f"Generating SQL via LLM for: {question}", extra={"node": "sql_path"})
 
@@ -345,8 +474,8 @@ async def sql_path(state: Dict):
             )
         else:
             metric_section = (
-                "Known Metric Definitions:\n"
-                f"{_get_metrics_catalog().build_all_context()}"
+                "No specific metric was identified for this question. "
+                "Generate SQL based on the schema and question alone."
             )
 
         base_prompt = load_prompt("sql_agent.txt").format(
@@ -426,6 +555,24 @@ async def sql_path(state: Dict):
             return {"sql_result": f"Query:\n{sql}\n\nResult:\n{sql_result}"}
 
 
+DOC_TYPE_HINTS = {
+    "docs_then_sql": "policy",
+    "sql_then_docs": "policy",
+    "docs_only": None,
+    "parallel": None,
+}
+
+
+def _build_doc_filter(state: Dict) -> dict:
+    """Build PGVector metadata filter from route context."""
+    filters = {}
+    route = state.get("route", "")
+    doc_type = DOC_TYPE_HINTS.get(route)
+    if doc_type:
+        filters["doc_type"] = doc_type
+    return filters
+
+
 async def vector_retrieval(state: Dict):
     with NodeTimer("vector_retrieval"):
         question = state["question"]
@@ -435,7 +582,18 @@ async def vector_retrieval(state: Dict):
 
         try:
             store = _get_vector_store()
-            results = await asyncio.to_thread(store.similarity_search, search_query, k=4)
+            metadata_filter = _build_doc_filter(state)
+            search_kwargs = {"k": 6}
+            if metadata_filter:
+                search_kwargs["filter"] = metadata_filter
+                logger.info(
+                    f"Applying doc filter: {metadata_filter}",
+                    extra={"node": "vector_retrieval", "filter": str(metadata_filter)},
+                )
+
+            results = await asyncio.to_thread(
+                store.similarity_search, search_query, **search_kwargs,
+            )
             docs = []
             for doc in results:
                 source = doc.metadata.get("title", doc.metadata.get("source", "Unknown"))
@@ -495,6 +653,23 @@ async def answer_generator(state: Dict):
         return {"final_answer": content}
 
 
+def _compute_confidence(state: Dict, review_score: float, validator_failures: list) -> str:
+    compiled = state.get("compiled_metric", False)
+    retries = state.get("reflection_attempt", 0)
+    has_sql = bool(state.get("sql_result", "")) and not state.get("sql_result", "").startswith(("Error", "N/A"))
+    has_docs = bool(state.get("retrieved_docs"))
+
+    if compiled and review_score >= 8.0 and not validator_failures:
+        return "high"
+    if compiled and review_score >= 6.0:
+        return "high"
+    if review_score >= 8.0 and not validator_failures and (has_sql or has_docs):
+        return "medium"
+    if review_score >= 6.0 and retries == 0:
+        return "medium"
+    return "low"
+
+
 async def reviewer_node(state: Dict):
     with NodeTimer("reviewer"):
         history = _format_history(state)
@@ -519,6 +694,8 @@ async def reviewer_node(state: Dict):
             answer=state.get("final_answer", ""),
             retrieved_docs=state.get("retrieved_docs", []),
             route=state.get("route", ""),
+            resolved_metric=state.get("resolved_metric", ""),
+            compiled_metric=state.get("compiled_metric", False),
         )
 
         if validator_failures:
@@ -545,6 +722,8 @@ async def reviewer_node(state: Dict):
             result["final_answer"] = scan["clean_text"]
             result["review_score"] = min(score, 6.0)
 
+        result["confidence"] = _compute_confidence(state, result["review_score"], validator_failures)
+
         logger.info(f"Review score: {result['review_score']}", extra={"node": "reviewer", "score": result["review_score"]})
         REVIEW_SCORE.observe(result["review_score"])
         return result
@@ -553,12 +732,12 @@ async def reviewer_node(state: Dict):
 async def cache_write(state: Dict):
     with NodeTimer("cache_write"):
         if state.get("review_score", 0) >= 7.0 and state.get("final_answer"):
-            key = _cache_key(state["question"])
+            key = _state_cache_key(state)
             try:
                 await asyncio.to_thread(
                     redis_client.set, key, state["final_answer"], timedelta(hours=24),
                 )
-                logger.info("Cached answer", extra={"node": "cache_write"})
+                logger.info("Cached answer", extra={"node": "cache_write", "cache_key": key})
             except Exception as e:
                 logger.warning(f"Cache write failed: {e}", extra={"node": "cache_write", "error": str(e)})
         return {}

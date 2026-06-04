@@ -55,3 +55,23 @@ def sample_state_with_history():
         ],
         "cache_hit": False,
     }
+
+
+@pytest.fixture
+def sample_state_with_rich_history():
+    """Workflow state with enriched conversation history (metric context + data)."""
+    return {
+        "question": "Break that down by department",
+        "session_id": "test-session",
+        "conversation_history": [
+            {
+                "question": "What is the compliance effectiveness score for Legal?",
+                "answer": "The Compliance Effectiveness Score for the Legal department is 55.0%.",
+                "resolved_metric": "compliance_effectiveness_score",
+                "metric_version": "1.0",
+                "route": "sql_only",
+                "data_summary": "[('Legal', 100, 55, 55.0)]",
+            }
+        ],
+        "cache_hit": False,
+    }

@@ -7,26 +7,16 @@ from .base import DatabaseConnector
 from typing import List
 from observability import logger
 
-CATALOG_PATH = Path(__file__).parent.parent / "catalog.json"
+CATALOG_PATH = Path(__file__).parent.parent / "catalog"
 
-# SQL allowlist: only SELECT statements permitted
-_SELECT_PATTERN = re.compile(
-    r"^\s*SELECT\s",
-    re.IGNORECASE | re.DOTALL,
-)
-
-# Additional dangerous patterns to reject even inside SELECT
-_DANGEROUS_PATTERNS = [
-    re.compile(r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|GRANT|CREATE|EXEC|MERGE|CALL)\b", re.IGNORECASE),
-    re.compile(r";\s*\w"),          # Statement chaining via semicolon
-    re.compile(r"--"),               # SQL line comments
-    re.compile(r"/\*"),              # SQL block comments
-    re.compile(r"UTL_|DBMS_|SYS\."), # Oracle dangerous packages
+_ORACLE_DANGEROUS_PATTERNS = [
+    re.compile(r"UTL_|DBMS_|SYS\.", re.IGNORECASE),
 ]
 
 
 class OracleConnector(DatabaseConnector):
     def __init__(self, llm=None):
+        super().__init__(llm=llm, catalog_path=CATALOG_PATH)
         oracle_user = os.getenv("ORACLE_USER", "user")
         oracle_password = os.getenv("ORACLE_PASSWORD", "password")
         oracle_host = os.getenv("ORACLE_HOST", "localhost")
@@ -43,11 +33,6 @@ class OracleConnector(DatabaseConnector):
             max_overflow=20
         )
         self.schema_owner = os.getenv("ORACLE_SCHEMA", "COMPLIANCE")
-        self.llm = llm
-
-        # Load rich business catalog
-        with open(CATALOG_PATH, "r", encoding="utf-8") as f:
-            self.catalog = json.load(f)
 
     def get_relevant_tables(self, question: str) -> List[str]:
         """Keyword-based table selection (no LLM call)."""
@@ -55,14 +40,14 @@ class OracleConnector(DatabaseConnector):
 
     def build_table_selection_prompt(self, question: str) -> str:
         """Build a prompt for LLM-based table selection."""
-        catalog_summary = self._get_catalog_summary()
+        catalog_summary = self._get_table_selection_summary()
         return (
             f"You are a senior Oracle database expert.\n\n"
             f"User Question: {question}\n\n"
             f"Available Tables and their business meaning:\n"
             f"{catalog_summary}\n\n"
             f"Select ONLY the tables that are needed to answer this question.\n"
-            f"Return maximum 5 tables.\n"
+            f"Return maximum 8 tables.\n"
             f"Return only table names separated by commas.\n\n"
             f"Example output: COMPLIANCE_VIOLATIONS, CONTROL_MAPPINGS, RISK_EVENTS"
         )
@@ -70,31 +55,26 @@ class OracleConnector(DatabaseConnector):
     def parse_table_selection(self, llm_response: str) -> List[str]:
         """Parse table names from an LLM response."""
         tables = [t.strip().upper() for t in llm_response.split(",") if t.strip()]
-        return tables[:5]
+        return tables[:8]
 
     def _get_catalog_summary(self) -> str:
         """Create rich summary for LLM."""
         summary = ""
-        for schema_name, schema_data in self.catalog["schemas"].items():
-            for table_name, info in schema_data["tables"].items():
-                summary += f"Table: {table_name}\n"
-                summary += f"Description: {info['description']}\n"
-                summary += "Columns:\n"
-                for col, desc in info["columns"].items():
-                    summary += f"  - {col}: {desc}\n"
-                summary += "\n"
+        for table_name in self._get_all_table_names():
+            info = self._load_table(table_name)
+            if not info:
+                continue
+            summary += f"Table: {table_name}\n"
+            summary += f"Description: {info['description']}\n"
+            summary += "Columns:\n"
+            for col, desc in info["columns"].items():
+                summary += f"  - {col}: {desc}\n"
+            summary += "\n"
         return summary
 
     def _keyword_fallback(self, question: str) -> List[str]:
-        """Fallback if LLM fails."""
-        words = set(question.upper().split())
-        relevant = []
-        for schema_data in self.catalog["schemas"].values():
-            for table_name, info in schema_data["tables"].items():
-                desc_upper = info["description"].upper()
-                if any(word in table_name or word in desc_upper for word in words):
-                    relevant.append(table_name)
-        return relevant[:5]
+        """Fallback if LLM fails — delegates to base class with synonym support."""
+        return super()._keyword_fallback(question)
 
     def get_table_schema(self, table_names: List[str]) -> str:
         """Return rich business context from catalog."""
@@ -103,15 +83,13 @@ class OracleConnector(DatabaseConnector):
 
         schema_text = ""
         for table in table_names:
-            for schema_data in self.catalog["schemas"].values():
-                if table in schema_data["tables"]:
-                    info = schema_data["tables"][table]
-                    schema_text += f"\nTable: {table}\n"
-                    schema_text += f"Description: {info['description']}\n"
-                    schema_text += "Columns and Meaning:\n"
-                    for col, desc in info["columns"].items():
-                        schema_text += f"  - {col}: {desc}\n"
-                    break
+            info = self._load_table(table)
+            if info:
+                schema_text += f"\nTable: {table}\n"
+                schema_text += f"Description: {info['description']}\n"
+                schema_text += "Columns and Meaning:\n"
+                for col, desc in info["columns"].items():
+                    schema_text += f"  - {col}: {desc}\n"
         return schema_text.strip()
 
     def validate_columns(self, sql: str, table_names: List[str]) -> str:
@@ -119,10 +97,9 @@ class OracleConnector(DatabaseConnector):
         Returns error description or empty string if valid."""
         table_columns = {}
         for table in table_names:
-            for schema_data in self.catalog["schemas"].values():
-                if table in schema_data["tables"]:
-                    table_columns[table] = set(schema_data["tables"][table]["columns"].keys())
-                    break
+            cols = self._get_table_columns(table)
+            if cols:
+                table_columns[table] = cols
 
         if not table_columns:
             return ""
@@ -164,19 +141,17 @@ class OracleConnector(DatabaseConnector):
         return "; ".join(errors)
 
     def _validate_sql(self, sql: str) -> str:
-        """Validate SQL is a safe SELECT query. Returns error message or empty string."""
-        if not _SELECT_PATTERN.match(sql):
-            return "Only SELECT queries are allowed."
-
-        for pattern in _DANGEROUS_PATTERNS:
+        """Validate SQL safety — base checks + Oracle-specific dangerous packages."""
+        error = self.validate_sql(sql)
+        if error:
+            return error
+        for pattern in _ORACLE_DANGEROUS_PATTERNS:
             match = pattern.search(sql)
             if match:
-                return f"Forbidden SQL pattern detected: {match.group()}"
-
+                return f"Forbidden Oracle pattern detected: {match.group()}"
         return ""
 
     def execute_query(self, sql: str) -> str:
-        # Allowlist validation
         error = self._validate_sql(sql)
         if error:
             logger.warning(

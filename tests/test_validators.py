@@ -11,6 +11,8 @@ from validators import (
     validate_sql_safety,
     validate_result_sanity,
     validate_answer_grounding,
+    validate_number_grounding,
+    validate_metric_citation,
     run_all_validators,
 )
 
@@ -166,6 +168,101 @@ class TestAnswerGrounding:
         assert result.passed
 
 
+class TestNumberGrounding:
+    def test_all_numbers_grounded(self):
+        result = validate_number_grounding(
+            answer="There are 42 violations with a score of 85.5.",
+            sql_result="[('count', 42), ('score', 85.5)]",
+        )
+        assert result.passed
+
+    def test_many_ungrounded_numbers(self):
+        result = validate_number_grounding(
+            answer="Revenue was 5000, cost was 3200, profit was 1800, margin was 36%.",
+            sql_result="[('total', 999)]",
+        )
+        assert not result.passed
+        assert result.score_cap == 5.0
+
+    def test_trivial_numbers_ignored(self):
+        result = validate_number_grounding(
+            answer="The score is 0 out of 100 based on 1 violation.",
+            sql_result="[('result', 55)]",
+        )
+        assert result.passed
+
+    def test_no_sql_result_skips(self):
+        result = validate_number_grounding(
+            answer="The score is 42.",
+            sql_result="N/A - no SQL data retrieved",
+        )
+        assert result.passed
+
+    def test_no_numbers_in_answer(self):
+        result = validate_number_grounding(
+            answer="The compliance program is effective.",
+            sql_result="[('score', 95)]",
+        )
+        assert result.passed
+
+    def test_few_ungrounded_passes(self):
+        result = validate_number_grounding(
+            answer="The score improved by 15 points to reach 85.",
+            sql_result="[('score', 85)]",
+        )
+        assert result.passed
+
+    def test_error_result_skips(self):
+        result = validate_number_grounding(
+            answer="The score is 42.",
+            sql_result="Error: something went wrong",
+        )
+        assert result.passed
+
+
+class TestMetricCitation:
+    def test_compiled_metric_cited(self):
+        result = validate_metric_citation(
+            answer="The compliance effectiveness score is 85%.",
+            resolved_metric="compliance_effectiveness_score",
+            compiled_metric=True,
+        )
+        assert result.passed
+
+    def test_compiled_metric_not_cited(self):
+        result = validate_metric_citation(
+            answer="The result is 85%.",
+            resolved_metric="compliance_effectiveness_score",
+            compiled_metric=True,
+        )
+        assert not result.passed
+        assert result.score_cap == 6.0
+
+    def test_non_compiled_skipped(self):
+        result = validate_metric_citation(
+            answer="The result is 85%.",
+            resolved_metric="compliance_effectiveness_score",
+            compiled_metric=False,
+        )
+        assert result.passed
+
+    def test_no_metric_skipped(self):
+        result = validate_metric_citation(
+            answer="The result is 85%.",
+            resolved_metric="",
+            compiled_metric=True,
+        )
+        assert result.passed
+
+    def test_partial_match_passes(self):
+        result = validate_metric_citation(
+            answer="Based on the compliance effectiveness analysis, the score is 85%.",
+            resolved_metric="compliance_effectiveness_score",
+            compiled_metric=True,
+        )
+        assert result.passed
+
+
 class TestRunAllValidators:
     def test_all_pass(self):
         passed, failures, cap = run_all_validators(
@@ -190,3 +287,17 @@ class TestRunAllValidators:
         assert not passed
         assert len(failures) >= 2
         assert cap == 0.0
+
+    def test_new_validators_integrated(self):
+        """New validators (number grounding + metric citation) run in the aggregate."""
+        passed, failures, cap = run_all_validators(
+            sql="SELECT 1 FROM T",
+            sql_result="[('x', 42)]",
+            answer="The result is 999.",
+            retrieved_docs=[],
+            route="sql_only",
+            resolved_metric="test_metric",
+            compiled_metric=True,
+        )
+        assert not passed
+        assert any("test_metric" in f for f in failures)

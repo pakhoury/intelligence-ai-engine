@@ -553,27 +553,23 @@ class TestBuildAllContext:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# Workflow integration: resolved metric context flows to LLM SQL
+# Workflow integration: resolved metric uses deterministic compiler
 # ═════════════════════════════════════════════════════════════════════════
 
-class TestResolvedMetricFlowsToLlm:
-    """When metric resolver matches a metric, its full definition is passed
-    to the LLM as context for SQL generation."""
+class TestResolvedMetricUsesCompiler:
+    """When metric resolver matches a compilable metric, the deterministic
+    compiler generates SQL — the LLM SQL path is skipped entirely."""
 
     @patch("nodes.redis_client")
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
     @patch("nodes.db_connector")
     @patch("nodes._get_vector_store")
-    @patch("nodes._get_metrics_catalog")
     @patch("nodes._get_metric_resolver")
-    async def test_resolved_metric_context_in_sql_prompt(
+    async def test_compiled_metric_skips_llm_sql(
         self, mock_resolver_fn,
-        mock_catalog_fn, mock_vs_fn, mock_db,
+        mock_vs_fn, mock_db,
         mock_ainvoke, mock_redis,
     ):
-        from metrics import MetricsCatalog
-        mock_catalog_fn.return_value = MetricsCatalog()
-
         mock_redis.get.return_value = None
         mock_redis.set.return_value = True
 
@@ -585,11 +581,6 @@ class TestResolvedMetricFlowsToLlm:
         mock_resolver.resolve = AsyncMock(return_value=resolved)
         mock_resolver_fn.return_value = mock_resolver
 
-        mock_db.build_table_selection_prompt.return_value = "table selection prompt"
-        mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
-        mock_db.get_relevant_tables.return_value = ["COMPLIANCE_VIOLATIONS"]
-        mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS"
-        mock_db.validate_columns.return_value = ""
         mock_db.execute_query.return_value = "[(100, 85, 85.00)]"
 
         mock_doc = MagicMock()
@@ -602,8 +593,6 @@ class TestResolvedMetricFlowsToLlm:
         mock_ainvoke.side_effect = [
             "SQL_ONLY",
             "NO_CLARIFICATION_NEEDED",
-            "COMPLIANCE_VIOLATIONS",
-            "SELECT COUNT(*) AS total, SUM(CASE WHEN STATUS='Closed' THEN 1 ELSE 0 END) AS closed FROM COMPLIANCE_VIOLATIONS",
             "The compliance effectiveness score is 85%.",
             "Score: 9.0\nDecision: APPROVED",
         ]
@@ -615,13 +604,15 @@ class TestResolvedMetricFlowsToLlm:
                 "session_id": "test-metric-flow",
                 "conversation_history": [],
             },
-            config={"configurable": {"thread_id": "test-metric-llm-flow"}},
+            config={"configurable": {"thread_id": "test-metric-compiler-flow"}},
         )
 
         assert result.get("resolved_metric") == "compliance_effectiveness_score"
-        assert "compiled_sql" not in result
+        assert result.get("compiled_metric") is True
         assert "85" in result.get("sql_result", "")
+        assert "COMPLIANCE_VIOLATIONS" in result.get("sql_result", "")
 
-        sql_prompt = mock_ainvoke.call_args_list[3][0][0]
-        assert "Resolved Metric Definition" in sql_prompt
-        assert "(number of closed violations / total number of violations) * 100" in sql_prompt
+        mock_db.build_table_selection_prompt.assert_not_called()
+
+        llm_prompts = [call[0][0] for call in mock_ainvoke.call_args_list]
+        assert not any("Resolved Metric Definition" in p for p in llm_prompts)

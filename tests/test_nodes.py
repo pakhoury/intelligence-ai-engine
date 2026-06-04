@@ -307,12 +307,9 @@ class TestBuildMetricContext:
 
 
 class TestSqlPath:
-    @patch("nodes._get_metrics_catalog")
     @patch("nodes.db_connector")
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
-    async def test_generates_and_executes_sql(self, mock_ainvoke, mock_db, mock_catalog_fn, sample_state):
-        from metrics import MetricsCatalog
-        mock_catalog_fn.return_value = MetricsCatalog()
+    async def test_generates_and_executes_sql(self, mock_ainvoke, mock_db, sample_state):
         mock_db.build_table_selection_prompt.return_value = "table selection prompt"
         mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
         mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS\nColumns: ..."
@@ -328,12 +325,9 @@ class TestSqlPath:
         assert "sql_result" in result
         assert "Critical" in result["sql_result"]
 
-    @patch("nodes._get_metrics_catalog")
     @patch("nodes.db_connector")
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
-    async def test_strips_markdown_fences(self, mock_ainvoke, mock_db, mock_catalog_fn, sample_state):
-        from metrics import MetricsCatalog
-        mock_catalog_fn.return_value = MetricsCatalog()
+    async def test_strips_markdown_fences(self, mock_ainvoke, mock_db, sample_state):
         mock_db.build_table_selection_prompt.return_value = "table selection prompt"
         mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
         mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS"
@@ -350,12 +344,9 @@ class TestSqlPath:
         called_sql = mock_db.execute_query.call_args[0][0]
         assert "```" not in called_sql
 
-    @patch("nodes._get_metrics_catalog")
     @patch("nodes.db_connector")
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
-    async def test_uses_extracted_context(self, mock_ainvoke, mock_db, mock_catalog_fn, sample_state):
-        from metrics import MetricsCatalog
-        mock_catalog_fn.return_value = MetricsCatalog()
+    async def test_uses_extracted_context(self, mock_ainvoke, mock_db, sample_state):
         sample_state["extracted_context"] = "SUM(fine_amount + remediation_cost)"
         mock_db.build_table_selection_prompt.return_value = "table selection prompt"
         mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
@@ -398,13 +389,10 @@ class TestSqlPath:
         assert "(closed / total) * 100" in sql_prompt
         assert "Known Metric Definitions:\n" not in sql_prompt
 
-    @patch("nodes._get_metrics_catalog")
     @patch("nodes.db_connector")
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
-    async def test_falls_back_to_catalog_without_metric(self, mock_ainvoke, mock_db, mock_catalog_fn, sample_state):
-        """Without metric_context, the prompt includes the full catalog."""
-        from metrics import MetricsCatalog
-        mock_catalog_fn.return_value = MetricsCatalog()
+    async def test_falls_back_to_clean_message_without_metric(self, mock_ainvoke, mock_db, sample_state):
+        """Without metric_context, the prompt uses a clean fallback instead of dumping the catalog."""
         mock_db.build_table_selection_prompt.return_value = "table selection prompt"
         mock_db.parse_table_selection.return_value = ["COMPLIANCE_VIOLATIONS"]
         mock_db.get_table_schema.return_value = "Table: COMPLIANCE_VIOLATIONS"
@@ -418,8 +406,7 @@ class TestSqlPath:
         from nodes import sql_path
         result = await sql_path(sample_state)
         sql_prompt = mock_ainvoke.call_args_list[1][0][0]
-        assert "Known Metric Definitions:\n" in sql_prompt
-        assert "Compliance Effectiveness Score" in sql_prompt
+        assert "No specific metric was identified" in sql_prompt
         assert "Resolved Metric Definition (follow this formula" not in sql_prompt
 
 
@@ -450,7 +437,7 @@ class TestVectorRetrieval:
 
         from nodes import vector_retrieval
         result = await vector_retrieval(sample_state)
-        mock_store.similarity_search.assert_called_once_with("ACCESS_CONTROL", k=4)
+        mock_store.similarity_search.assert_called_once_with("ACCESS_CONTROL", k=6)
 
     @patch("nodes._get_vector_store")
     async def test_handles_pgvector_error(self, mock_store_fn, sample_state):
@@ -574,6 +561,62 @@ class TestCacheKeyNormalization:
         key2 = _cache_key("What is AML policy?")
         assert key1 != key2
 
+    def test_same_question_different_metric_different_keys(self):
+        from nodes import _cache_key
+        key1 = _cache_key("What is the score?", resolved_metric="metric_a")
+        key2 = _cache_key("What is the score?", resolved_metric="metric_b")
+        assert key1 != key2
+
+    def test_same_question_different_params_different_keys(self):
+        from nodes import _cache_key
+        key1 = _cache_key("compliance score", resolved_metric="ces", metric_params={"department": "Legal"})
+        key2 = _cache_key("compliance score", resolved_metric="ces", metric_params={"department": "HR"})
+        assert key1 != key2
+
+    def test_no_metric_matches_plain_key(self):
+        from nodes import _cache_key
+        key1 = _cache_key("How many violations?")
+        key2 = _cache_key("How many violations?", resolved_metric="", metric_params=None)
+        assert key1 == key2
+
+
+class TestContextResolver:
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_passes_through_without_history(self, mock_ainvoke, sample_state):
+        sample_state["conversation_history"] = []
+        from nodes import context_resolver
+        result = await context_resolver(sample_state)
+        assert result["original_question"] == sample_state["question"]
+        assert "question" not in result
+        mock_ainvoke.assert_not_called()
+
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_rewrites_followup_question(self, mock_ainvoke, sample_state_with_rich_history):
+        mock_ainvoke.return_value = (
+            "Break down the compliance effectiveness score by department"
+        )
+        from nodes import context_resolver
+        result = await context_resolver(sample_state_with_rich_history)
+        assert result["original_question"] == "Break that down by department"
+        assert result["question"] == "Break down the compliance effectiveness score by department"
+
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_preserves_standalone_question(self, mock_ainvoke, sample_state_with_rich_history):
+        sample_state_with_rich_history["question"] = "How many audit findings are open?"
+        mock_ainvoke.return_value = "How many audit findings are open?"
+        from nodes import context_resolver
+        result = await context_resolver(sample_state_with_rich_history)
+        assert result["original_question"] == "How many audit findings are open?"
+        assert "interpreted_as" not in result or result.get("question") == result["original_question"]
+
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_falls_back_on_llm_failure(self, mock_ainvoke, sample_state_with_rich_history):
+        mock_ainvoke.side_effect = Exception("LLM timeout")
+        from nodes import context_resolver
+        result = await context_resolver(sample_state_with_rich_history)
+        assert result["original_question"] == "Break that down by department"
+        assert "question" not in result
+
 
 class TestFormatHistory:
     def test_empty_history(self, sample_state):
@@ -587,6 +630,35 @@ class TestFormatHistory:
         assert "User:" in result
         assert "Assistant:" in result
         assert "violations" in result.lower()
+
+    def test_formats_rich_history_with_metric_context(self, sample_state_with_rich_history):
+        from nodes import _format_history
+        result = _format_history(sample_state_with_rich_history)
+        assert "User:" in result
+        assert "Assistant:" in result
+        assert "Metric: compliance_effectiveness_score@1.0" in result
+        assert "Route: sql_only" in result
+        assert "Data:" in result
+
+    def test_handles_mixed_history_formats(self):
+        """Old-format entries (no metadata) coexist with enriched entries."""
+        from nodes import _format_history
+        state = {
+            "conversation_history": [
+                {"question": "Old question", "answer": "Old answer"},
+                {
+                    "question": "New question",
+                    "answer": "New answer",
+                    "resolved_metric": "test_metric",
+                    "route": "sql_only",
+                },
+            ]
+        }
+        result = _format_history(state)
+        lines = result.split("\n")
+        assert any("Old question" in l for l in lines)
+        assert any("Metric: test_metric" in l for l in lines)
+        assert sum(1 for l in lines if l.startswith("[")) == 1
 
     def test_limits_to_5_turns(self):
         from nodes import _format_history

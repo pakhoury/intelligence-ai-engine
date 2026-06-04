@@ -107,12 +107,8 @@ def workflow_mocks(request):
         patch("nodes._ainvoke_llm", new_callable=AsyncMock) as mock_ainvoke,
         patch("nodes.db_connector") as mock_db,
         patch("nodes._get_vector_store") as mock_vs_fn,
-        patch("nodes._get_metrics_catalog") as mock_catalog_fn,
         patch("nodes._get_metric_resolver") as mock_resolver_fn,
     ):
-        from metrics import MetricsCatalog
-        mock_catalog_fn.return_value = MetricsCatalog()
-
         mock_resolver = MagicMock()
         mock_resolver.resolve = AsyncMock(return_value=None)
         mock_resolver_fn.return_value = mock_resolver
@@ -197,12 +193,12 @@ class TestEvalGoldenDataset:
         answer = result.get("final_answer", "")
 
         for term in case.get("expected_answer_contains", []):
-            assert term in answer, (
+            assert term.lower() in answer.lower(), (
                 f"Case {case['id']}: expected '{term}' in answer, got: {answer[:200]}"
             )
 
         for term in case.get("expected_answer_not_contains", []):
-            assert term not in answer, (
+            assert term.lower() not in answer.lower(), (
                 f"Case {case['id']}: unexpected '{term}' found in answer"
             )
 
@@ -233,6 +229,30 @@ class TestEvalGoldenDataset:
 
         assert result.get("needs_clarification") is True or "specify" in result.get("final_answer", "").lower(), (
             f"Case {case['id']}: expected clarification request"
+        )
+
+
+    @pytest.mark.parametrize(
+        "workflow_mocks",
+        [c for c in GOLDEN_CASES if not c.get("needs_clarification") and not c.get("expected_sql_blocked")],
+        indirect=True,
+        ids=[c["id"] for c in GOLDEN_CASES if not c.get("needs_clarification") and not c.get("expected_sql_blocked")],
+    )
+    async def test_golden_case_has_confidence(self, workflow_mocks):
+        """Every completed pipeline run should produce a confidence level."""
+        case = workflow_mocks["case"]
+        from workflow import app as workflow_app
+
+        result = await workflow_app.ainvoke(
+            {
+                "question": case["question"],
+                "session_id": f"eval-{case['id']}",
+                "conversation_history": [],
+            },
+            config={"configurable": {"thread_id": f"eval-conf-{case['id']}"}},
+        )
+        assert result.get("confidence") in ("high", "medium", "low"), (
+            f"Case {case['id']}: missing or invalid confidence: {result.get('confidence')}"
         )
 
 

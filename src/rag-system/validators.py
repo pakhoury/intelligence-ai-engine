@@ -113,12 +113,72 @@ def validate_answer_grounding(
     return result
 
 
+TRIVIAL_NUMBERS = frozenset({
+    "0", "1", "2", "3", "4", "5", "10", "100", "1000",
+    "0.0", "1.0", "0.00", "100.0", "100.00",
+})
+
+
+def validate_number_grounding(
+    answer: str,
+    sql_result: str,
+) -> ValidationResult:
+    """Check that numeric claims in the answer appear in the SQL result."""
+    result = ValidationResult()
+
+    if not answer or not sql_result or sql_result.startswith(("Error:", "N/A")):
+        return result
+
+    answer_numbers = set(re.findall(r"\b(\d+\.?\d*)\b", answer))
+    sql_numbers = set(re.findall(r"\b(\d+\.?\d*)\b", sql_result))
+
+    meaningful = answer_numbers - TRIVIAL_NUMBERS
+    if not meaningful:
+        return result
+
+    ungrounded = meaningful - sql_numbers
+    if len(ungrounded) > 3:
+        result.fail(
+            f"{len(ungrounded)} numeric claims in answer not found in SQL results "
+            f"(e.g. {', '.join(list(ungrounded)[:3])})",
+            cap=5.0,
+        )
+
+    return result
+
+
+def validate_metric_citation(
+    answer: str,
+    resolved_metric: str,
+    compiled_metric: bool,
+) -> ValidationResult:
+    """When a metric was compiled deterministically, the answer should reference it."""
+    result = ValidationResult()
+
+    if not compiled_metric or not resolved_metric:
+        return result
+
+    metric_words = set(resolved_metric.replace("_", " ").lower().split())
+    answer_lower = answer.lower()
+
+    matched = sum(1 for w in metric_words if w in answer_lower)
+    if matched < len(metric_words) * 0.5:
+        result.fail(
+            f"Answer does not reference the resolved metric '{resolved_metric}'",
+            cap=6.0,
+        )
+
+    return result
+
+
 def run_all_validators(
     sql: str,
     sql_result: str,
     answer: str,
     retrieved_docs: List[str],
     route: str,
+    resolved_metric: str = "",
+    compiled_metric: bool = False,
 ) -> Tuple[bool, List[str], float]:
     """
     Run all deterministic validators and return aggregate result.
@@ -130,6 +190,8 @@ def run_all_validators(
         validate_sql_safety(sql),
         validate_result_sanity(sql_result),
         validate_answer_grounding(answer, sql_result, retrieved_docs, route),
+        validate_number_grounding(answer, sql_result),
+        validate_metric_citation(answer, resolved_metric, compiled_metric),
     ]
 
     all_passed = all(r.passed for r in results)
