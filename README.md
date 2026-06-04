@@ -1,30 +1,35 @@
-# AI Runtime Platform
+# Intelligence AI Engine
 
-A hybrid Retrieval-Augmented Generation system that answers compliance questions by combining **structured data** (Oracle SQL) with **unstructured knowledge** (document semantic search). The system autonomously classifies each question, selects an execution strategy, chains data sources when one source's output informs another, synthesizes an answer, and self-reviews for quality before caching.
+A federated Retrieval-Augmented Generation platform that answers compliance and risk questions by combining **structured data** (Oracle SQL) with **unstructured knowledge** (document semantic search). The system classifies each question, selects an execution strategy, chains data sources when needed, compiles deterministic SQL for registered metrics, synthesizes an answer, and validates it through 5 deterministic validators + an LLM reviewer before caching.
 
-Built for a regulated financial services context where answers must be grounded in both quantitative records and policy documents.
+Built for regulated financial services where answers must be grounded, auditable, and reproducible.
 
 ## Why This Architecture
 
-Traditional RAG systems retrieve documents and generate answers. Compliance teams need more: they ask questions that span structured data ("How many KYC violations this quarter?") and policy interpretation ("What does our framework say about VaR limits?") -- often in the same question. And frequently, the answer from one source is needed to query the other ("What is the compliance cost for 2024?" needs the cost formula from docs before it can generate the right SQL).
+Traditional RAG systems retrieve documents and generate answers. Compliance teams need more: questions span structured data ("How many KYC violations this quarter?") and policy interpretation ("What does our framework say about VaR limits?") — often in the same question. And frequently, the answer from one source is needed to query the other ("What is the compliance cost for 2024?" needs the cost formula from docs before generating the right SQL).
 
-This system solves that with a **strategy-based hybrid pipeline**: an LLM classifies each query into one of five execution strategies, retrieves from the appropriate sources -- chaining them when needed -- and generates a grounded answer. A reviewer node scores every response; low-quality answers trigger a reflection loop for self-correction before caching.
+This system solves that with a **strategy-based hybrid pipeline**: an LLM classifies each query into one of five execution strategies, retrieves from the appropriate sources — chaining them when needed — and generates a grounded answer. Registered business metrics bypass the LLM entirely via a **deterministic SQL compiler**, eliminating hallucination risk for known KPIs. Every response includes a confidence score and full execution metadata.
 
 ### Key Design Decisions
 
 | Decision | Rationale | Trade-off |
 |----------|-----------|-----------|
-| LangGraph over LangChain agents | Deterministic state machine with explicit conditional edges. No autonomous tool-calling loops that could produce runaway LLM calls. | Less flexible than a ReAct agent, but predictable cost and latency per query. |
-| 5 routing strategies | Beyond simple SQL/Docs/Both: `docs_then_sql` and `sql_then_docs` chain sources so one source's output informs the next query. An extract node bridges them. | More complex routing logic, but handles questions like "compliance cost" (needs formula from docs before SQL) or "top violation and its policy" (needs data before doc search). |
-| LLM-driven table selection | The Oracle connector passes a business catalog to the LLM to pick relevant tables, rather than embedding table names or using keyword matching. | Costs one extra LLM call per SQL query, but dramatically improves SQL accuracy for natural language questions. |
-| SQL validation + retry loop | Generated SQL is validated against the catalog schema before execution. Invalid column references are caught pre-execution and fed back to the LLM for correction (up to 2 retries). | Adds latency on malformed queries, but prevents cryptic Oracle errors from reaching the answer generator. |
-| Persistent PostgreSQL checkpointer | LangGraph state is stored in PostgreSQL (via `langgraph-checkpoint-postgres`), surviving restarts and shared across workers. Falls back to in-memory for local dev. | Unified on psycopg v3 for both PGVector and checkpointer. Enables durable audit trails for regulatory compliance. |
-| Non-blocking Redis via `asyncio.to_thread` | Cache check, cache write, conversation history load/save all run in background threads to avoid blocking the async event loop. | Thread pool overhead vs native async Redis, but simpler migration and consistent with how Oracle calls are handled. |
-| Request-level timeout | Every workflow invocation is wrapped in `asyncio.wait_for` with a configurable timeout (default 60s). | Prevents unbounded requests when LLM or database hangs. Returns 504 instead of hanging indefinitely. |
-| Review score default of 0.0 | When the reviewer LLM returns unparseable output, the score defaults to 0.0 (fail) instead of 7.0 (pass). | Conservative: a non-parseable review triggers the reflection loop rather than silently passing a potentially bad answer into the cache. |
-| Redis for both cache and history | Single dependency for response caching (24h TTL) and conversation history (1h TTL). | Acceptable for this scale. At higher throughput, separate the workloads or use a dedicated session store. |
-| PII redaction + DLP gate | SQL results are scrubbed for PII (emails, SSNs, phone numbers, card numbers, IBANs) before reaching the answer generator. The reviewer node runs a second DLP scan on the final answer; any leaked PII is redacted and the review score is capped at 6.0, preventing caching. | Two-layer defense. Adds negligible latency (regex-based, no external API). |
-| Local embeddings (MiniLM-L6-v2) | Embedding model runs in-process, no external API call for vector search. | ~80MB memory overhead, but eliminates a network dependency and per-request embedding cost. |
+| LangGraph over LangChain agents | Deterministic state machine with explicit conditional edges. No autonomous tool-calling loops. | Less flexible than ReAct, but predictable cost and latency. |
+| 5 routing strategies | `docs_then_sql` and `sql_then_docs` chain sources so one source's output informs the next. | More complex routing, but handles multi-source questions correctly. |
+| Deterministic metric compiler | Registered metrics produce SQL from structured definitions (SELECT, WHERE, GROUP BY clauses). Zero LLM calls, same input = same SQL. | Only works for pre-registered metrics. Ad-hoc queries still use LLM. |
+| Dual-path SQL execution | Compiler-first: try deterministic compilation, fall through to LLM only if metric is unresolved or non-compilable. | Slight code complexity, but eliminates LLM hallucination for all registered metrics. |
+| Per-table catalog with on-demand loading | `database_metadata.json` index + one JSON per table. Tables loaded and cached only when needed. | More files to manage, but scales to 50+ tables without startup cost. |
+| Model fallback chain | Primary LLM (llama-3.3-70b) + fallback (llama-3.1-8b). Circuit breaker triggers automatic fallback. | Fallback model is smaller (lower quality), but service stays up. |
+| 5 deterministic validators | SQL safety, result sanity, answer grounding, number grounding, metric citation — each with independent score caps. | Adds review latency, but catches failures LLM reviewer misses. |
+| Confidence scoring | `high/medium/low` computed from: compiled vs LLM path, review score, validator failures. | Requires tuning thresholds, but gives users actionable trust signal. |
+| Enriched cache keys | `question + resolved_metric + params` prevents parameter collisions. | Metric queries have lower cache hit rate, but no stale answers. |
+| MemorySaver fatal in production | PostgreSQL checkpointer failure raises `RuntimeError` unless `ENVIRONMENT=development`. | Crashes the app on PG failure, but audit trail loss is unacceptable for compliance. |
+| SQL validation + retry loop | Column references validated against catalog pre-execution. Errors fed back to LLM (up to 2 retries). | Adds latency on malformed queries, but prevents cryptic Oracle errors. |
+| Metadata-filtered vector retrieval | PGVector JSONB filtering by `doc_type`/`category` based on route. k=6 for broader recall. | Route-based heuristic may miss edge cases, but precision improves significantly at scale. |
+| Persistent PostgreSQL checkpointer | LangGraph state stored in PostgreSQL, surviving restarts. | Requires PG dependency, but enables regulatory audit trails. |
+| Non-blocking Redis via `asyncio.to_thread` | Cache, history operations run in background threads. | Thread pool overhead, but consistent with Oracle call pattern. |
+| Request-level timeout | `asyncio.wait_for` with configurable timeout (default 60s). Returns 504 on hang. | Kills slow queries, but prevents unbounded resource consumption. |
+| PII redaction + DLP gate | Two-layer defense: SQL results scrubbed pre-answer, final answer scanned post-review. | Regex-based (no NER), but catches emails, SSNs, phones, cards, IBANs with negligible latency. |
 
 ## System Architecture
 
@@ -47,60 +52,91 @@ This system solves that with a **strategy-based hybrid pipeline**: an LLM classi
                        HIT /    \ MISS
                         |        |
                         v        v
-                      [END]  +--------+
-                             | router |  (LLM: 5 strategies)
-                             +---+----+
-                                 |
-                                 v
-                           +-----------+
-                           |  clarify  |  (LLM detects ambiguity)
-                           +-----+-----+
-                       __________|__________
-                      /    |    |    |      \
-              sql_only  sql_  docs_  docs_  parallel
-                        then  then   only
-                        docs  sql
-                        |     |     |     |       |
-                        v     v     v     v       v
-                 (see routing paths table below)
-                              |
-                     [Context Window Manager]
-                              |
-                              v
-                    +---------+---------+
-                    | answer_generator  |<------+
-                    +---------+---------+       |
-                              |           [reflection]
-                              v                 |
-                      +-------+-------+         |
-                      |   reviewer    |---------+
-                      |  (score + DLP)|   (if score < 7
-                      +-------+-------+    and attempts < 2)
-                              |
-                              v
-                      +-------+-------+
-                      |  cache_write  |  (caches if score >= 7)
-                      +-------+-------+
-                              |
-                              v
-                           [END]
+                      [END]  +------------------+
+                             | context_resolver  |  (rewrites follow-ups)
+                             +--------+---------+
+                                      |
+                                      v
+                                 +--------+
+                                 | router |  (LLM: 5 strategies)
+                                 +---+----+
+                                     |
+                                     v
+                               +-----------+
+                               |  clarify  |  (LLM detects ambiguity)
+                               +-----+-----+
+                                     |
+                                     v
+                            +----------------+
+                            | metric_resolver|  (LLM: match registered metrics)
+                            +--------+-------+
+                           __________|__________
+                          /    |    |    |      \
+                  sql_only  sql_  docs_  docs_  parallel
+                            then  then   only
+                            docs  sql
+                            |     |     |     |       |
+                            v     v     v     v       v
+                     (see routing paths table below)
+                                  |
+                         [Context Window Manager]
+                                  |
+                                  v
+                        +---------+---------+
+                        | answer_generator  |<------+
+                        +---------+---------+       |
+                                  |           [reflection]
+                                  v                 |
+                          +-------+-------+         |
+                          |   reviewer    |---------+
+                          | (LLM + 5     |   (if score < 7
+                          |  validators) |    and attempts < 2)
+                          +-------+-------+
+                                  |
+                                  v
+                          +-------+-------+
+                          |  cache_write  |  (enriched key, caches if score >= 7)
+                          +-------+-------+
+                                  |
+                                  v
+                               [END]
 ```
+
+### Dual-Path SQL Execution
+
+```
+            metric_resolver matches?
+                  /         \
+               YES           NO
+                |             |
+                v             v
+        MetricCompiler    LLM SQL Path
+     (deterministic SQL)  (table selection +
+                          SQL generation +
+                          validation + retry)
+                |             |
+                v             v
+           execute_query  execute_query
+                \           /
+                 v         v
+              answer_generator
+```
+
+Registered metrics (7 currently) produce **identical SQL every time** — no LLM involved. Ad-hoc queries go through the LLM path with 3-layer validation.
 
 ### Routing Strategies
 
 | Strategy | Flow | Example | Typical Latency |
 |----------|------|---------|-----------------|
-| **sql_only** | clarify -> sql_path -> answer -> reviewer | "How many violations in Q4?" | 2-4s |
-| **docs_only** | clarify -> vector_retrieval -> answer -> reviewer | "What is our access control policy?" | 2-3s |
-| **docs_then_sql** | clarify -> vector_retrieval -> **extract** -> sql_path -> answer -> reviewer | "What is compliance cost for 2024?" (needs formula from docs first) | 4-6s |
-| **sql_then_docs** | clarify -> sql_path -> **extract** -> vector_retrieval -> answer -> reviewer | "Top violation and its policy?" (needs data before doc search) | 4-6s |
-| **parallel** | clarify -> sql_path -> vector_retrieval -> answer -> reviewer | "List violations and summarize the framework" | 3-5s |
+| **sql_only** | metric_resolver -> [compiler or LLM SQL] -> answer -> reviewer | "How many violations in Q4?" | 2-4s |
+| **docs_only** | vector_retrieval -> answer -> reviewer | "What is our access control policy?" | 2-3s |
+| **docs_then_sql** | vector_retrieval -> **extract** -> sql_path -> answer -> reviewer | "What is compliance cost for 2024?" (needs formula from docs first) | 4-6s |
+| **sql_then_docs** | sql_path -> **extract** -> vector_retrieval -> answer -> reviewer | "Top violation and its policy?" (needs data before doc search) | 4-6s |
+| **parallel** | sql_path -> vector_retrieval -> answer -> reviewer | "List violations and summarize the framework" | 3-5s |
 | **Cache Hit** | cache_check -> END | Repeated question within 24h | <50ms |
 | **Clarification** | router -> clarify -> END | "Show me the data" (vague) | ~1s |
 
 ### Chained Strategies: How Extract Works
-
-The **extract node** bridges two data sources when one needs the other's output:
 
 **docs_then_sql** ("What is the compliance cost for 2024?"):
 1. `vector_retrieval` finds the cost formula in policy documents
@@ -110,96 +146,189 @@ The **extract node** bridges two data sources when one needs the other's output:
 **sql_then_docs** ("Most common violation and its policy?"):
 1. `sql_path` queries the database and finds "ACCESS_CONTROL: 47 incidents"
 2. `extract` pulls the key term: "ACCESS_CONTROL"
-3. `vector_retrieval` uses "ACCESS_CONTROL" as the search query instead of the original question, finding the specific policy
+3. `vector_retrieval` uses "ACCESS_CONTROL" as the search query instead of the original question
 
-If extraction fails (no usable content, or the LLM returns `EXTRACTION_FAILED`), the system falls back gracefully -- the downstream source receives the original question instead of extracted context.
+If extraction fails, the downstream source receives the original question instead of extracted context.
 
-### SQL Generation Pipeline
+## Deterministic Metric Compiler
 
-The SQL path includes a three-stage safety net:
+The biggest correctness improvement over typical RAG systems. Registered metrics bypass the LLM entirely:
 
-1. **Catalog-aware generation** -- The LLM receives the full business catalog with table descriptions and column meanings, not raw DDL. This produces more accurate SQL because the LLM understands the domain semantics.
+```
+Question: "What is the compliance effectiveness score?"
+    |
+    v
+Metric Resolver: matches "compliance_effectiveness_score" (confidence: 1.0)
+    |
+    v
+Metric Compiler: assembles SQL from structured definition
+    |
+    v
+SQL:  SELECT
+        COUNT(*) AS total_violations,
+        SUM(CASE WHEN STATUS = 'Closed' THEN 1 ELSE 0 END) AS closed_violations,
+        ROUND(SUM(CASE WHEN STATUS = 'Closed' THEN 1 ELSE 0 END) * 100.0
+              / NULLIF(COUNT(*), 0), 2) AS effectiveness_score
+      FROM COMPLIANCE_VIOLATIONS
+      WHERE VIOLATION_DATE >= ADD_MONTHS(SYSDATE, -12)
+      FETCH FIRST 500 ROWS ONLY
+```
 
-2. **Pre-execution validation** -- Before any SQL hits Oracle, column references are validated against the catalog. If the LLM references `SOE_ID` from a table that doesn't have it, the error is caught immediately with a descriptive message.
+**Same input always produces same SQL.** Parameters are sanitized, row limits enforced, no LLM interpretation involved.
 
-3. **Error-driven retry** -- If validation or execution fails, the error is fed back to the LLM with the original prompt. The LLM gets up to 2 retry attempts to produce correct SQL. This handles transient generation errors without failing the entire query.
+### Registered Metrics
 
-Additionally, a SQL allowlist enforces that only `SELECT` statements execute. `DROP`, `DELETE`, `UPDATE`, statement chaining (`;`), comment injection (`--`, `/*`), and Oracle system packages (`UTL_`, `DBMS_`, `SYS.`) are all blocked.
+| Metric | Unit | Compilation Mode | Tables |
+|--------|------|------------------|--------|
+| Compliance Effectiveness Score | % | clause | COMPLIANCE_VIOLATIONS |
+| Violation Severity Distribution | count | clause | COMPLIANCE_VIOLATIONS |
+| Audit Finding Resolution Rate | % | clause | AUDIT_FINDINGS |
+| Regulatory Exposure Index | USD | clause | COMPLIANCE_VIOLATIONS |
+| Department Risk Score | score | template | COMPLIANCE_VIOLATIONS, AUDIT_FINDINGS, RISK_EVENTS |
+| Control Coverage Ratio | % | clause | CONTROL_MAPPINGS |
+| Mean Time to Resolution | days | clause | COMPLIANCE_VIOLATIONS |
+
+Each metric is defined in `metrics_catalog.yaml` with: formula, calculation steps, parameters (with defaults), thresholds, and interpretation text. The compiler supports two modes: **clause-based** (assembles SELECT/WHERE/GROUP BY from structured definitions) and **template-based** (substitutes parameters into pre-written SQL for complex multi-table queries).
+
+## Correctness & Validation
+
+### 5 Deterministic Validators
+
+Every answer passes through 5 validators that run alongside the LLM reviewer. Each has an independent score cap:
+
+| Validator | What It Catches | Score Cap |
+|-----------|----------------|-----------|
+| **SQL Safety** | DROP, DELETE, injection, unbalanced parens, statement chaining | 0.0 |
+| **Result Sanity** | Empty results, execution errors, suspiciously large numbers | 3.0-6.0 |
+| **Answer Grounding** | Answer claims data but no SQL/docs were retrieved | 3.0 |
+| **Number Grounding** | Numeric claims in answer don't appear in SQL result | 5.0 |
+| **Metric Citation** | Compiled metric answer doesn't reference the metric name | 6.0 |
+
+### Confidence Scoring
+
+Every response includes a confidence level computed from the execution path:
+
+| Confidence | Criteria |
+|------------|----------|
+| **high** | Compiled metric + review score >= 8.0 + no validator failures |
+| **medium** | LLM SQL path + good score + supporting data; or compiled with moderate score |
+| **low** | Retries needed, validator failures, or low review score |
+
+## Scalability
+
+### Per-Table Catalog
+
+```
+catalog/
+├── database_metadata.json          # Index: table name + description + file pointer
+└── tables/
+    ├── COMPLIANCE_VIOLATIONS.json   # Full column definitions
+    ├── AUDIT_FINDINGS.json
+    ├── CONTROL_MAPPINGS.json
+    └── RISK_EVENTS.json
+```
+
+- **At startup:** only the lightweight index is loaded (~50 lines at 50 tables)
+- **At query time:** per-table files loaded on demand and cached
+- **Adding a table:** one JSON file + one line in the index
+
+### Token Budget at Scale
+
+| Stage | 4 Tables (current) | 50 Tables |
+|-------|-------------------|-----------|
+| Table selection prompt | ~400 tokens | ~2,000 tokens (1 line per table) |
+| SQL generation prompt | ~1,000 tokens | ~1,500 tokens (selected tables only) |
+| Compiled metric SQL | 0 LLM tokens | 0 LLM tokens |
+| Vector retrieval | k=6, filtered | k=6, metadata-filtered |
+
+### Additional Scaling Features
+
+- **Synonym-enhanced keyword fallback** — 12 compliance domain synonyms (exposure -> RISK_EVENTS, penalty -> VIOLATIONS, etc.) for when LLM table selection fails
+- **Model fallback chain** — primary LLM failure triggers automatic fallback to secondary model via circuit breaker
+- **Table cap raised to 8** — supports cross-domain queries spanning multiple schemas
+- **Metadata-filtered vector search** — PGVector JSONB filtering by `doc_type`/`category` based on route context
 
 ## Tech Stack
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| LLM | Llama 3.3 70B via Groq | Routing, SQL generation, extraction, answering, reviewing |
+| LLM | Llama 3.3 70B via Groq + fallback (3.1 8B) | Routing, SQL generation, extraction, answering, reviewing |
 | Embeddings | all-MiniLM-L6-v2 (local) | Document embedding and semantic search |
 | Orchestration | LangGraph | Stateful workflow with conditional routing and reflection |
 | API | FastAPI + Uvicorn | REST API with auth, rate limiting, CORS |
 | Structured Data | Oracle XE 21c | Compliance violations, audit findings, risk events, controls |
-| Vector Store | PostgreSQL 16 + PGVector | Semantic search over compliance documents |
+| Vector Store | PostgreSQL 16 + PGVector | Semantic search with JSONB metadata filtering |
 | Cache | Redis 7 | Response caching (24h TTL) + conversation history (1h TTL) |
-| Checkpointer | PostgreSQL (via langgraph-checkpoint-postgres) | Persistent audit trail and conversation state across restarts |
+| Checkpointer | PostgreSQL (langgraph-checkpoint-postgres) | Persistent audit trail (mandatory in production) |
 | Metrics | Prometheus + Grafana | Request latency, LLM tokens/cost, cache hit rate, review scores |
-| Ingestion | PyPDF + openpyxl | PDF and Excel document loading for vector store |
 | Tracing | OpenTelemetry (OTLP) | Distributed tracing with per-node spans |
-| Logging | Structured JSON | Trace IDs, node attribution, LLM call details |
+| CI/CD | GitHub Actions | Lint -> All tests -> Docker build |
 
 ## Project Structure
 
 ```
 intelligence-ai-engine/
 ├── docker-compose.yml              # 6 services: Oracle, Postgres, Redis, App, Prometheus, Grafana
-├── docker-compose.override.yml     # Dev override: enables --reload for hot reloading
-├── Dockerfile                      # Multi-stage build, non-root user, 4 workers, healthcheck
-├── pyproject.toml                  # Ruff, mypy, pytest configuration
+├── docker-compose.override.yml     # Dev: hot reload
+├── Dockerfile                      # Multi-stage, non-root, 4 workers, healthcheck
+├── pyproject.toml                  # Ruff, mypy, pytest config
 ├── requirement.txt
-├── .env                            # Runtime configuration (API keys, DB credentials)
+├── .env                            # Runtime config (API keys, DB credentials)
 │
-├── src/rag-system/                 # Application code
-│   ├── main.py                     # FastAPI endpoints: /query, /health, /ready, /metrics, /audit
-│   ├── config.py                   # LLM, DB connector, Redis client initialization
-│   ├── workflow.py                 # LangGraph state machine: 5 strategies, extract node, reflection loop
-│   ├── nodes.py                    # Workflow nodes (cache, router, extract, SQL, vector, answer, review)
-│   ├── security.py                 # Auth, rate limiting, input validation, prompt injection guard, PII, DLP
-│   ├── observability.py            # OpenTelemetry + Prometheus + structured JSON logging
-│   ├── llm_ops.py                  # Cost tracking, context window management, model fallback
-│   ├── metrics.py                  # Metrics catalog: loads business metric definitions from YAML
-│   ├── metrics_catalog.yaml        # 7 defined metrics with formulas, steps, thresholds
-│   ├── catalog.json                # Oracle table catalog with business-level descriptions
+├── src/rag-system/
+│   ├── main.py                     # FastAPI: /query, /health, /ready, /metrics, /audit
+│   ├── config.py                   # LLM (primary + fallback), DB, Redis init
+│   ├── workflow.py                 # LangGraph: 11 nodes, 5 strategies, reflection
+│   ├── nodes.py                    # All workflow nodes + compiled metric path
+│   ├── security.py                 # Auth, rate limit, injection guard, PII, DLP
+│   ├── observability.py            # OTel + Prometheus + structured JSON logging
+│   ├── llm_ops.py                  # Cost tracking, context window, model fallback chain
+│   ├── validators.py               # 5 deterministic validators
+│   ├── circuit_breaker.py          # Circuit breaker for LLM calls
+│   ├── metrics_catalog.yaml        # 7 metric definitions with formulas + thresholds
+│   ├── catalog/                    # Per-table database schema catalog
+│   │   ├── database_metadata.json  # Table index (lightweight)
+│   │   └── tables/                 # One JSON per table (loaded on demand)
 │   ├── database/
-│   │   ├── base.py                 # Abstract DatabaseConnector interface
-│   │   └── oracle.py               # Oracle: LLM table selection, SQL validation, column validation
+│   │   ├── base.py                 # Abstract DatabaseConnector (on-demand catalog loading)
+│   │   └── oracle.py               # Oracle: LLM table selection, SQL validation
+│   ├── metrics/
+│   │   ├── registry.py             # Immutable MetricDefinition dataclasses
+│   │   ├── loader.py               # YAML -> MetricRegistry
+│   │   ├── resolver.py             # Deterministic keyword-based metric resolution
+│   │   ├── llm_resolver.py         # LLM-based metric resolution (higher accuracy)
+│   │   ├── compiler.py             # MetricDefinition -> deterministic SQL
+│   │   ├── catalog.py              # Legacy catalog context builder
+│   │   └── validator.py            # Metric definition validation against DB catalog
 │   ├── ingest/
-│   │   └── ingest.py               # PDF + Excel ingestion, chunking, and PGVector storage
-│   └── prompts/                    # LLM prompt templates (versioned in llm_ops.py)
+│   │   └── ingest.py               # PDF + Excel ingestion into PGVector
+│   └── prompts/                    # LLM prompt templates
 │       ├── router.txt              # Query classification (5 strategies)
-│       ├── clarification.txt       # Ambiguity detection (history-aware)
+│       ├── clarification.txt       # Ambiguity detection
+│       ├── context_resolver.txt    # Follow-up question rewriting
 │       ├── extract.txt             # Context extraction between chained sources
-│       ├── sql_agent.txt           # Oracle SQL generation with schema + history context
-│       ├── final_answer.txt        # Answer synthesis from SQL + docs + history
-│       └── reviewer.txt            # Quality scoring (0-10) with history consistency check
+│       ├── sql_agent.txt           # Oracle SQL generation
+│       ├── metric_resolver.txt     # LLM metric matching
+│       ├── final_answer.txt        # Answer synthesis
+│       └── reviewer.txt            # Quality scoring (0-10)
 │
 ├── tests/
-│   ├── conftest.py                 # Shared fixtures (mock LLM, mock Redis, sample states)
-│   ├── test_nodes.py               # Node-level unit tests (40 tests, mocked dependencies)
-│   ├── test_workflow.py            # Workflow integration tests with mocked externals (10 tests)
-│   ├── test_security.py            # Security tests: input validation, SQL injection, auth, PII, DLP (32 tests)
-│   ├── test_metrics.py             # Metrics catalog + workflow metric routing tests (19 tests)
-│   ├── test_ingest.py              # Excel ingestion tests (7 tests)
-│   └── test_hybrid_rag.py          # End-to-end tests against live infrastructure (13 scenarios)
+│   ├── conftest.py                 # Shared fixtures
+│   ├── test_nodes.py               # ~60 node-level unit tests
+│   ├── test_metric_compiler.py     # 39 golden tests: resolver -> compiler -> SQL
+│   ├── test_validators.py          # 39 validator tests (all 5 validators)
+│   ├── test_eval.py                # 56 evaluation tests (21 golden cases)
+│   ├── golden_dataset.yaml         # 21 golden cases: all routes + edge cases
+│   ├── test_workflow.py            # 10 workflow integration tests
+│   ├── test_metrics.py             # ~140 metric pipeline tests
+│   ├── test_security.py            # ~35 security tests
+│   └── test_hybrid_rag.py          # E2E tests (requires live infrastructure)
 │
-├── oracle-init/                    # Database initialization scripts (auto-run on first start)
-│   ├── 01_create_schema.sql
-│   ├── 02_create_tables.sql
-│   └── 03_seed_data.sql
-│
+├── oracle-init/                    # DB init scripts (auto-run on first start)
 ├── monitoring/
-│   ├── prometheus.yml              # Scrape config: app:8000/metrics every 15s
+│   ├── prometheus.yml
 │   └── grafana/
-│       ├── provisioning/           # Auto-provisioned Prometheus datasource
-│       └── dashboards/             # Pre-built 9-panel observability dashboard
-│
-├── documents/                      # Source compliance PDFs for ingestion
-└── .github/workflows/ci.yml        # CI: lint -> test -> docker build
+└── .github/workflows/ci.yml        # CI: lint -> all tests -> Docker build
 ```
 
 ## Quick Start
@@ -216,32 +345,31 @@ git clone <repo-url>
 cd intelligence-ai-engine
 ```
 
-Create `.env` (only `GROQ_API_KEY` is required -- all other values have defaults in `docker-compose.yml`):
+Create `.env`:
 
 ```env
 GROQ_API_KEY=gsk_your_key_here
 ```
 
-When running **outside Docker** (e.g., local development against Docker services), override hosts to `localhost`:
+For local development (outside Docker):
 
 ```env
 GROQ_API_KEY=gsk_your_key_here
 REDIS_HOST=localhost
 ORACLE_HOST=localhost
 POSTGRES_HOST=localhost
+ENVIRONMENT=development
 ```
 
 ### 2. Start
 
 ```bash
-# Production (4 workers, no hot reload)
+# Production (4 workers, audit trail enforced)
 docker-compose -f docker-compose.yml up -d
 
-# Development (hot reload enabled via override)
+# Development (hot reload, MemorySaver allowed)
 docker-compose up -d
 ```
-
-Six containers start: Oracle (allow ~2 min for first boot), PostgreSQL + PGVector, Redis, the FastAPI app, Prometheus, and Grafana.
 
 ### 3. Ingest documents
 
@@ -249,21 +377,12 @@ Six containers start: Oracle (allow ~2 min for first boot), PostgreSQL + PGVecto
 docker exec rag-app python ingest/ingest.py
 ```
 
-Loads compliance PDFs and Excel files from the `documents/` folder into PGVector. Excel files are converted row-by-row into `Column: Value` documents with sheet-level metadata.
-
-### 4. Verify
+### 4. Query
 
 ```bash
-# Liveness
-curl http://localhost:8000/health
-
-# Readiness (checks Oracle, Postgres, Redis)
-curl http://localhost:8000/ready
-
-# First query
 curl -X POST http://localhost:8000/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "How many compliance violations per severity level?"}'
+  -d '{"question": "What is the compliance effectiveness score?"}'
 ```
 
 ## API Reference
@@ -273,16 +392,24 @@ curl -X POST http://localhost:8000/query \
 ```json
 // Request
 {
-  "question": "Show me all KYC violations and explain our compliance policy on KYC",
+  "question": "What is the compliance effectiveness score for the Legal department?",
   "session_id": "optional-for-multi-turn"
 }
 
 // Response
 {
-  "answer": "Based on SQL results, there are 2 KYC violations... Section 5.1 requires...",
+  "answer": "The Compliance Effectiveness Score for Legal is 55.0%, rated as Warning...",
   "cache_hit": false,
-  "session_id": "generated-or-provided-id",
-  "trace_id": "a1b2c3d4e5f6"
+  "session_id": "abc-123",
+  "trace_id": "tr-9f8e7d",
+  "metadata": {
+    "route": "sql_only",
+    "resolved_metric": "compliance_effectiveness_score",
+    "metric_version": "1.0",
+    "compiled": true,
+    "confidence": "high",
+    "review_score": 9.0
+  }
 }
 ```
 
@@ -290,305 +417,173 @@ curl -X POST http://localhost:8000/query \
 
 **Rate limit:** 30 requests/minute per API key or IP.
 
-**Timeout:** Configurable via `REQUEST_TIMEOUT` env var (default 60s). Returns HTTP 504 on timeout.
-
 ### GET /health
 
 Liveness probe. Returns 200 if the process is running.
 
 ### GET /ready
 
-Readiness probe. Returns 200 if Oracle, PostgreSQL, and Redis are all reachable; 503 otherwise.
+Readiness probe. Returns 200 if Oracle, PostgreSQL, and Redis are all reachable; 503 with degraded status otherwise.
 
 ### GET /audit/{thread_id}
 
-Returns the full state history for a session -- every node's input/output state, step number, and timestamp. Requires `X-API-Key` header. Backed by PostgreSQL checkpointer for persistence across restarts.
-
-```json
-// Response
-{
-  "thread_id": "session-uuid",
-  "total_steps": 8,
-  "trail": [
-    {"step": 0, "node": "cache_check", "timestamp": "...", "state": {...}},
-    {"step": 1, "node": "router", "timestamp": "...", "state": {...}}
-  ]
-}
-```
+Full state history for a session — every node's input/output state, step number, timestamp.
 
 ### GET /metrics
 
-Prometheus-format metrics. Scraped automatically by the Prometheus container.
+Prometheus-format metrics (20+ metric families).
 
 ## Multi-Turn Conversations
-
-The system maintains per-session conversation history, enabling contextual follow-ups. All LLM nodes (router, clarification, SQL generation, answer generation, reviewer) receive conversation history for full context.
 
 ```bash
 # Turn 1
 curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "How many compliance violations per severity level?", "session_id": "s1"}'
-# -> "There are 2 Critical, 3 High, 2 Low, and 3 Medium violations."
+  -d '{"question": "What is the compliance effectiveness score?", "session_id": "s1"}'
+# -> "The score is 85%..."
 
-# Turn 2 -- references Turn 1
+# Turn 2 — references Turn 1
 curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
   -d '{"question": "Break that down by department", "session_id": "s1"}'
-# -> SQL node uses history to understand "that" refers to severity distribution
+# -> context_resolver rewrites to "Break down the compliance effectiveness score by department"
 
-# Turn 3 -- references Turn 2
+# Turn 3 — references Turn 2
 curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
   -d '{"question": "What does our policy say about those?", "session_id": "s1"}'
-# -> "According to Section 4.3 of the Internal Trading Policy..."
+# -> Routes to sql_then_docs, finds policy for the departments mentioned
 ```
 
-History is stored in Redis (1h TTL, last 10 turns retained, last 5 sent to LLM). All history content is sanitized against prompt injection before inclusion in LLM prompts. Omit `session_id` for stateless single-turn queries.
+History stored in Redis (1h TTL, last 10 turns, last 5 sent to LLM). All history sanitized against prompt injection.
 
 ## Security Model
 
-The system defends against threats at multiple layers:
-
 | Layer | Threat | Mitigation |
 |-------|--------|------------|
-| **Network** | Unauthorized access | API key authentication via `X-API-Key` header. Keys validated against `API_KEYS` env var (hashed for logging). Dev mode (no keys configured) disables auth. |
-| **Network** | Abuse / DoS | Rate limiting at 30 req/min per API key or IP via `slowapi`. Request timeout (default 60s) prevents resource exhaustion. |
-| **Input** | Prompt injection | 11 regex patterns detect injection attempts (`ignore previous instructions`, `<system>`, `[INST]`, etc.). Blocked with HTTP 400. |
-| **Input** | Oversized input | Question length enforced: min 3, max 2,000 characters. |
-| **Context** | History-based injection | Conversation history sanitized through `sanitize_for_prompt()` before LLM inclusion. Injection markers replaced with `[FILTERED]`, HTML tags stripped. |
-| **Database** | SQL injection / destructive queries | Allowlist enforces `SELECT`-only. Blocks `DROP`, `DELETE`, `UPDATE`, `INSERT`, statement chaining (`;`), comment injection (`--`, `/*`), and Oracle system packages (`UTL_`, `DBMS_`, `SYS.`). |
-| **Database** | Unbounded result sets | All queries appended with `FETCH FIRST 500 ROWS ONLY`. |
-| **Output** | PII in SQL results | SQL results are scrubbed for PII (emails, SSNs, phones, card numbers, IBANs) via regex before reaching the answer generator. |
-| **Output** | PII in final answer | DLP gate in the reviewer node scans every answer. Leaked PII is redacted and the review score is capped at 6.0, preventing caching of tainted responses. |
-| **Container** | Privilege escalation | App runs as non-root `appuser` inside the container. |
-| **CORS** | Cross-origin abuse | Configurable via `CORS_ALLOWED_ORIGINS`. Locked to explicit origins in production. |
+| **Network** | Unauthorized access | API key authentication via `X-API-Key` header |
+| **Network** | Abuse / DoS | Rate limiting at 30 req/min per API key or IP. Request timeout (default 60s) |
+| **Input** | Prompt injection | 11 regex patterns detect injection attempts. HTTP 400 on match |
+| **Input** | Oversized input | Min 3, max 2,000 characters |
+| **Context** | History-based injection | `sanitize_for_prompt()` strips injection markers, HTML tags |
+| **Database** | SQL injection | SELECT-only allowlist. Blocks DROP, DELETE, INSERT, UPDATE, statement chaining, comment injection, Oracle packages (UTL_, DBMS_, SYS.) |
+| **Database** | Unbounded results | All queries appended with `FETCH FIRST 500 ROWS ONLY` |
+| **Output** | PII in SQL results | Regex-based PII scrub before answer generation |
+| **Output** | PII in final answer | DLP gate in reviewer. PII redacted, score capped at 6.0 |
+| **Container** | Privilege escalation | Non-root `appuser` inside container |
 
 ## Observability
 
-### Metrics (Prometheus)
+### Prometheus Metrics (20+ families)
 
-The `/metrics` endpoint exposes 12 metric families (11 operational + 1 info). Prometheus scrapes every 15 seconds.
+| Metric | Type | Labels |
+|--------|------|--------|
+| `rag_requests_total` | Counter | `status` |
+| `rag_request_duration_seconds` | Histogram | — |
+| `rag_cache_operations_total` | Counter | `result` (hit/miss) |
+| `rag_route_total` | Counter | `route` |
+| `rag_llm_calls_total` | Counter | `node`, `status` |
+| `rag_llm_call_duration_seconds` | Histogram | `node` |
+| `rag_llm_tokens_total` | Counter | `node`, `type` |
+| `rag_llm_cost_usd` | Counter | `node` |
+| `rag_node_duration_seconds` | Histogram | `node` |
+| `rag_node_errors_total` | Counter | `node` |
+| `rag_review_score` | Histogram | — |
+| `rag_reflection_total` | Counter | — |
+| `rag_circuit_breaker_state` | Gauge | `name` |
+| `rag_validator_failures_total` | Counter | `validator` |
 
-| Metric | Type | Labels | What to Watch |
-|--------|------|--------|---------------|
-| `rag_requests_total` | Counter | `status` | Error rate: `rate({status="error"}[5m]) / rate(total[5m])` |
-| `rag_request_duration_seconds` | Histogram | -- | p95 latency: should stay under 5s for non-cache queries |
-| `rag_cache_operations_total` | Counter | `result` | Hit rate below 20% suggests cache TTL is too short or question diversity is high |
-| `rag_route_total` | Counter | `route` | Distribution shift may indicate prompt drift in the router |
-| `rag_llm_calls_total` | Counter | `node`, `status` | Error spikes here often mean API key quota exhaustion |
-| `rag_llm_call_duration_seconds` | Histogram | `node` | Groq p95 is typically 200-500ms; spikes suggest rate limiting |
-| `rag_llm_tokens_total` | Counter | `node`, `type` | Track burn rate against daily quota (100K tokens/day on Groq free tier) |
-| `rag_llm_cost_usd` | Counter | `node` | Cumulative cost tracking across providers |
-| `rag_node_duration_seconds` | Histogram | `node` | Identifies bottleneck nodes in the pipeline |
-| `rag_node_errors_total` | Counter | `node` | Elevated `sql_path` errors may indicate schema drift or LLM degradation |
-| `rag_review_score` | Histogram | -- | Sustained low scores signal answer quality degradation |
+### Grafana Dashboard
 
-### Dashboard (Grafana)
-
-A 9-panel dashboard is auto-provisioned at http://localhost:3000 (admin/admin):
-
-| Panel | Type | PromQL |
-|-------|------|--------|
-| Request Rate | Time series | `rate(rag_requests_total[5m])` |
-| Request Latency (p50/p95/p99) | Time series | `histogram_quantile(0.95, rate(rag_request_duration_seconds_bucket[5m]))` |
-| Cache Hit Rate | Gauge | `hit / (hit + miss) * 100` |
-| Route Distribution | Pie chart | `rag_route_total` |
-| LLM Latency by Node | Time series | `histogram_quantile(0.95, rate(rag_llm_call_duration_seconds_bucket[5m]))` |
-| Token Consumption | Time series | `rate(rag_llm_tokens_total[5m])` |
-| LLM Calls by Node | Bar chart | `rag_llm_calls_total` |
-| Node Execution Time | Time series | `histogram_quantile(0.95, rate(rag_node_duration_seconds_bucket[5m]))` |
-| Review Score Distribution | Histogram | `rag_review_score_bucket` |
+9-panel dashboard auto-provisioned at http://localhost:3000 (admin/admin): request rate, latency percentiles, cache hit rate, route distribution, LLM latency by node, token consumption, review score distribution.
 
 ### Structured Logs
 
-Every log line is JSON with trace ID and node attribution:
-
 ```json
-{"timestamp": "2026-05-03T10:15:21Z", "level": "INFO", "trace_id": "a1b2c3", "node": "router", "message": "Route decided: docs_then_sql", "route": "docs_then_sql"}
-{"timestamp": "2026-05-03T10:15:21Z", "level": "INFO", "trace_id": "a1b2c3", "node": "extract", "message": "Extracted context: SUM(fine_amount + remediation_cost + audit_fees)"}
-{"timestamp": "2026-05-03T10:15:22Z", "level": "INFO", "trace_id": "a1b2c3", "node": "sql_path", "message": "Generated SQL (attempt 1): SELECT SUM(fine_amount + remediation_cost) FROM COMPLIANCE_VIOLATIONS WHERE EXTRACT(YEAR FROM VIOLATION_DATE) = 2024"}
+{"timestamp": "2026-06-03T10:15:21Z", "level": "INFO", "trace_id": "a1b2c3", "node": "sql_path", "message": "Compiled metric SQL deterministically (clause): SELECT..."}
 ```
 
-### Distributed Tracing (OpenTelemetry)
+### Distributed Tracing
 
-Every workflow node and LLM call is wrapped in an OTel span. To connect a trace backend:
+Every node and LLM call wrapped in OTel spans. Set `OTEL_EXPORTER_OTLP_ENDPOINT` for Jaeger, Tempo, or Datadog.
 
-```yaml
-# docker-compose.yml
-OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
-```
+## Testing
 
-Compatible with Jaeger, Grafana Tempo, Datadog, and any OTLP-compatible backend.
-
-## Failure Modes
-
-| Failure | Impact | Behavior |
-|---------|--------|----------|
-| **Redis down** | Cache miss on every request, no conversation history | Graceful degradation. Cache check catches the exception and proceeds as a miss. History loads return empty. |
-| **Oracle down** | SQL-routed queries fail | `sql_path` returns an execution error string. The answer generator still produces a response noting the data is unavailable. |
-| **PGVector down** | Document-routed queries return no context | `vector_retrieval` catches the exception and returns an empty doc list. Answer is generated without document context. |
-| **Extract fails** | Chained strategy loses context bridge | Extract returns empty `extracted_context`. The downstream source (sql_path or vector_retrieval) falls back to using the original question. |
-| **PostgreSQL checkpointer unavailable** | Audit trail not persisted | Falls back to in-memory `MemorySaver` with a warning log. Audit trail works within the process lifetime but is lost on restart. |
-| **Groq API rate limit** | All LLM calls fail (router, SQL gen, answer, review) | `_ainvoke_llm` retries 3 times with exponential backoff for `TimeoutError` and `ConnectionError`. Sustained failures return 500. |
-| **Request timeout** | LLM or database hangs | `asyncio.wait_for` kills the workflow after `REQUEST_TIMEOUT` seconds (default 60). Returns HTTP 504 with trace ID. |
-| **LLM generates bad SQL** | Oracle returns an error | SQL validation catches column reference errors pre-execution. On execution errors, the error is fed back to the LLM for retry (up to 2 attempts). |
-| **LLM reviewer returns garbage** | Score can't be parsed | Score defaults to 0.0 (fail), triggering the reflection loop. Prevents bad answers from silently passing review and being cached. |
-
-## Data Sources
-
-### Oracle Database (4 tables, 33 seed rows)
-
-| Table | Records | Content |
-|-------|---------|---------|
-| `COMPLIANCE_VIOLATIONS` | 10 | Violations with severity, status, financial impact, employee attribution |
-| `AUDIT_FINDINGS` | 7 | Internal/external audit findings with risk ratings |
-| `CONTROL_MAPPINGS` | 8 | Controls mapped to compliance requirements |
-| `RISK_EVENTS` | 8 | Operational, credit, and market risk incidents with loss amounts |
-
-Table selection is LLM-driven: the Oracle connector passes a business-level catalog (`catalog.json`) to the LLM, which selects the most relevant tables for each query.
-
-### Metrics Catalog (7 business metrics)
-
-Defined in `metrics_catalog.yaml`, each metric includes a formula, calculation steps, required tables, parameters, and quality thresholds. The SQL agent receives all metric definitions in its prompt, enabling it to generate correct SQL for questions like "What is the compliance effectiveness score?" without needing a docs lookup.
-
-### PGVector Document Store (4 PDFs + Excel)
-
-The ingestion pipeline (`ingest/ingest.py`) supports both PDF and Excel files. PDFs are split into overlapping chunks (750 chars, 120 overlap). Excel files are converted row-by-row into `Column: Value` text documents with sheet-level metadata.
-
-| Document | Format | Content |
-|----------|--------|---------|
-| Corporate Compliance Policy 2024 | PDF | AML, KYC, data privacy, code of conduct, whistleblower protection |
-| Risk Management Framework v2.0 | PDF | Market/credit/operational/liquidity risk, VaR limits, stress testing |
-| Q3 2024 Internal Audit Report | PDF | KYC gaps, trade surveillance, access control, reporting findings |
-| SOE-45678 Incident Report | PDF | Unauthorized cross-trades, root cause analysis, remediation plan |
-| *(any .xlsx/.xls in documents/)* | Excel | Auto-ingested: each row becomes a searchable document |
-
-## Testing Strategy
-
-### Unit Tests (108 tests, no infrastructure required)
+### 379 Tests, 7 Suites
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v    # All tests, no infrastructure required
 ```
 
-All external dependencies (LLM, Oracle, PostgreSQL, Redis) are mocked. Tests validate:
+| Suite | Tests | Coverage |
+|-------|-------|----------|
+| `test_nodes.py` | ~60 | Every workflow node in isolation |
+| `test_metric_compiler.py` | 39 | Resolver -> compiler -> SQL for all 7 metrics |
+| `test_validators.py` | 39 | All 5 deterministic validators |
+| `test_eval.py` | 56 | 21 golden cases: routing + answer quality + confidence |
+| `test_workflow.py` | 10 | Full graph integration, all 5 routes |
+| `test_metrics.py` | ~140 | Registry, loader, resolver, LLM resolver, compiler, validator |
+| `test_security.py` | ~35 | Auth, rate limits, injection, PII, DLP |
 
-- **Node logic (40 tests):** Cache hit/miss (async), routing decisions for all 5 strategies with fuzzy matching, extract node for both chaining directions, SQL path with retry/markdown stripping/extracted context, vector retrieval with extracted context and error handling, review score parsing (including 0.0 default), DLP redaction, cache write thresholds, history formatting and truncation.
-- **Workflow integration (10 tests):** Full graph traversal for all 5 strategies (sql_only, docs_only, docs_then_sql, sql_then_docs, parallel), clarification early-exit, cache hit short-circuit, cache write conditions, reflection loop.
-- **Security (32 tests):** Input validation boundaries, 11 prompt injection patterns, SQL allowlist (SELECT-only, blocks DROP/DELETE/chaining/comments/Oracle packages), API key auth flows, PII redaction (email/SSN/phone/card/IBAN), DLP scanning.
-- **Metrics (19 tests):** Catalog loading, metric definitions, context building, SQL prompt integration, workflow metric routing.
-- **Ingestion (7 tests):** Excel file loading, row-to-document conversion, sheet-aware metadata, empty/sparse file handling, graceful openpyxl fallback.
+### Golden Evaluation Dataset
 
-### End-to-End Tests (13 scenarios, requires live infrastructure)
-
-```bash
-python tests/test_hybrid_rag.py
-```
-
-Runs against real Oracle, PostgreSQL, Redis, and Groq API.
+21 calibrated test cases in `tests/golden_dataset.yaml` covering:
+- All 5 routing strategies
+- All metric types (compliance, audit, risk, governance, operations)
+- Edge cases (empty results, vague questions, multi-table JOINs)
+- SQL injection attempts (DROP, comment injection)
+- Chained strategies (docs_then_sql, sql_then_docs)
+- Confidence scoring validation
 
 ### CI Pipeline
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main`/`develop` and on PRs:
+GitHub Actions on every push to `main`/`develop`:
+1. **Lint** — `ruff check src/rag-system/ tests/`
+2. **Test** — `pytest tests/` with 60% minimum coverage
+3. **Docker build** — builds image and verifies it starts
 
-1. **Lint** -- `ruff check src/rag-system/ tests/`
-2. **Test** -- `pytest tests/test_security.py tests/test_nodes.py` with 60% minimum coverage
-3. **Docker build** -- builds the image and verifies it starts
-
-## Switching LLM Providers
-
-The LLM is configured in `config.py` and controlled by the `LLM_MODEL` environment variable:
-
-```python
-# Groq (current -- free tier)
-from langchain_groq import ChatGroq
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0, max_tokens=1200)
-
-# OpenAI
-from langchain_openai import ChatOpenAI
-llm = ChatOpenAI(model="gpt-4o", temperature=0, max_tokens=1200)
-
-# Anthropic
-from langchain_anthropic import ChatAnthropic
-llm = ChatAnthropic(model="claude-sonnet-4-20250514", temperature=0, max_tokens=1200)
-
-# Google
-from langchain_google_genai import ChatGoogleGenerativeAI
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0, max_output_tokens=1200)
-```
-
-API key env vars: `GROQ_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`.
-
-## Configuration Reference
+## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GROQ_API_KEY` | *(required)* | Groq API key |
-| `LLM_MODEL` | `llama-3.3-70b-versatile` | LLM model identifier |
+| `LLM_MODEL` | `llama-3.3-70b-versatile` | Primary LLM model |
+| `LLM_FALLBACK_MODEL` | `llama-3.1-8b-instant` | Fallback LLM model |
 | `LLM_TIMEOUT` | `30` | LLM request timeout (seconds) |
-| `LLM_MAX_RETRIES` | `3` | LLM client retry attempts |
-| `REQUEST_TIMEOUT` | `60` | Overall request timeout for workflow execution (seconds) |
+| `REQUEST_TIMEOUT` | `60` | Workflow execution timeout (seconds) |
+| `ENVIRONMENT` | `development` | `development` allows MemorySaver fallback; anything else enforces PostgreSQL checkpointer |
 | `API_KEYS` | *(empty = auth disabled)* | Comma-separated valid API keys |
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma-separated allowed origins |
 | `REDIS_HOST` | `localhost` | Redis host |
-| `REDIS_PORT` | `6379` | Redis port |
-| `REDIS_PASSWORD` | *(empty)* | Redis password |
 | `POSTGRES_HOST` | `localhost` | PostgreSQL host |
-| `POSTGRES_USER` | `postgres` | PostgreSQL user |
-| `POSTGRES_PASSWORD` | `postgres` | PostgreSQL password |
-| `POSTGRES_DB` | `rag_db` | PostgreSQL database name |
 | `ORACLE_HOST` | `localhost` | Oracle host |
-| `ORACLE_PORT` | `1521` | Oracle listener port |
-| `ORACLE_SERVICE` | `XEPDB1` | Oracle service name |
-| `ORACLE_SCHEMA` | `COMPLIANCE_USER` | Oracle schema owner |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | OpenTelemetry OTLP endpoint |
-| `ENVIRONMENT` | `production` | Environment tag for tracing metadata |
+
+## Failure Modes
+
+| Failure | Behavior |
+|---------|----------|
+| Redis down | Cache miss on every request. History loads return empty. Graceful degradation. |
+| Oracle down | SQL queries fail. Answer notes data unavailable. |
+| PGVector down | Document queries return no context. Answer generated without docs. |
+| Groq rate limit | Circuit breaker opens. Fallback model (llama-3.1-8b) takes over automatically. |
+| Groq + fallback both down | Retries exhausted. Returns 500. |
+| PG checkpointer down (prod) | **App crashes with RuntimeError.** Audit trail loss is not tolerated. |
+| PG checkpointer down (dev) | Falls back to MemorySaver with warning. Audit trail lost on restart. |
+| LLM generates bad SQL | Column validation catches errors pre-execution. Error fed back for retry (up to 2). |
+| LLM reviewer unparseable | Score defaults to 0.0, triggering reflection loop. |
+| Request timeout | `asyncio.wait_for` kills workflow after `REQUEST_TIMEOUT`. Returns HTTP 504. |
 
 ## Operations
 
-### Start / Stop
-
 ```bash
-docker-compose up -d              # Development (hot reload via override)
-docker-compose -f docker-compose.yml up -d   # Production (4 workers, no reload)
-docker-compose down               # Stop (preserves data volumes)
-docker-compose down -v            # Stop and destroy all data
+docker-compose up -d                              # Dev (hot reload)
+docker-compose -f docker-compose.yml up -d         # Prod (4 workers)
+docker-compose down                                # Stop (preserves volumes)
+docker exec rag-redis redis-cli KEYS "rag:answer:*"  # List cached answers
+docker exec rag-redis redis-cli FLUSHDB             # Clear cache
 ```
-
-### Logs
-
-```bash
-docker-compose logs -f app        # Structured JSON logs from the application
-docker logs -f rag-app            # Same, via Docker directly
-```
-
-### Cache Management
-
-```bash
-docker exec rag-redis redis-cli KEYS "rag:answer:*"   # List cached answers
-docker exec rag-redis redis-cli KEYS "history:*"       # List active sessions
-docker exec rag-redis redis-cli FLUSHDB                # Clear all cache
-```
-
-### Service URLs
 
 | URL | Service |
 |-----|---------|
-| http://localhost:8000/docs | FastAPI -- interactive API docs |
-| http://localhost:8000/metrics | Prometheus metrics (raw) |
-| http://localhost:9090 | Prometheus -- query and explore metrics |
-| http://localhost:3000 | Grafana -- dashboards (admin/admin) |
-
-## Known Limitations and Future Work
-
-| Area | Current State | Production Path |
-|------|--------------|-----------------|
-| **PII patterns** | Regex-based (emails, SSNs, phones, cards, IBANs) -- no named entity recognition | Add spaCy NER or a dedicated PII service for names, addresses, dates of birth |
-| **Auth** | API key validation against env var | Integrate with OAuth2 / OIDC provider; add RBAC for audit endpoint access |
-| **Rate limiting** | In-memory via slowapi | Use Redis-backed rate limiter for multi-worker consistency |
-| **Embedding model** | all-MiniLM-L6-v2 (~80MB, 384-dim) -- English-only, general-purpose | Evaluate domain-specific financial embeddings for compliance terminology |
-| **Circuit breaker** | No circuit breaker on LLM or database calls | Add per-node circuit breakers to prevent cascading failures under sustained outages |
-| **LLM retry scope** | Only retries on `TimeoutError` and `ConnectionError` | Add Groq-specific exceptions (`RateLimitError`, `APIError`) to retry filter |
-| **Model fallback** | `ModelFallbackChain` class exists but is not wired into the main workflow | Configure fallback chain in `config.py` for production resilience |
-| **Horizontal scaling** | Single-instance with 4 Uvicorn workers | Stateless app (Redis + Postgres backed) is ready for multi-instance deployment behind a load balancer |
+| http://localhost:8000/docs | FastAPI interactive docs |
+| http://localhost:8000/metrics | Prometheus metrics |
+| http://localhost:9090 | Prometheus UI |
+| http://localhost:3000 | Grafana dashboards (admin/admin) |
