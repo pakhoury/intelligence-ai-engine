@@ -1,13 +1,14 @@
 import json
 import os
 import sys
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "rag-system"))
+import pytest
 
-from metrics.registry import MetricDefinition, MetricParameter, MetricRegistry
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "aria"))
+
 from metrics.llm_resolver import LLMMetricResolver, _build_catalog_context, _parse_response
+from metrics.registry import MetricDefinition, MetricParameter, MetricRegistry
 from metrics.resolver import ResolvedMetric
 
 

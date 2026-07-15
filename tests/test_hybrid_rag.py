@@ -10,12 +10,12 @@ Prerequisites:
 Usage:
   python tests/test_hybrid_rag.py
 """
-import sys
-import os
 import asyncio
+import os
+import sys
 
-# Add src/rag-system to path so imports work
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "rag-system"))
+# Add src/aria to path so imports work
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "aria"))
 
 
 def print_result(label: str, result: dict):
@@ -28,7 +28,7 @@ def print_result(label: str, result: dict):
     print(f"Docs:      {len(result.get('retrieved_docs', []))} chunks retrieved")
     print(f"Score:     {result.get('review_score', 'N/A')}")
     print(f"Clarify:   {result.get('needs_clarification', False)}")
-    print(f"----- Answer -----")
+    print("----- Answer -----")
     print(result.get("final_answer", "NO ANSWER"))
     print(f"{'='*70}\n")
 
@@ -203,8 +203,8 @@ async def run_single_test(workflow_app, test_case: dict) -> dict:
 
 
 async def run_all_tests():
-    from workflow import app as workflow_app
     from config import redis_client
+    from workflow import app as workflow_app
 
     # Flush cached answers so every query exercises the full pipeline
     try:
@@ -242,7 +242,7 @@ async def run_all_tests():
 
     # Summary
     print(f"\n\n{'='*70}")
-    print(f"TEST SUMMARY")
+    print("TEST SUMMARY")
     print(f"{'='*70}")
     for r in all_results:
         status = "PASS" if r.get("all_passed") else "FAIL"

@@ -1,0 +1,55 @@
+{
+  "schemas": {
+    "COMPLIANCE": {
+      "tables": {
+        "COMPLIANCE_VIOLATIONS": {
+          "description": "Core table storing all compliance violations and regulatory breaches",
+          "file": "tables/COMPLIANCE_VIOLATIONS.json"
+        },
+        "AUDIT_FINDINGS": {
+          "description": "Internal and external audit findings",
+          "file": "tables/AUDIT_FINDINGS.json"
+        },
+        "CONTROL_MAPPINGS": {
+          "description": "Mapping between controls and compliance requirements",
+          "file": "tables/CONTROL_MAPPINGS.json"
+        }
+      }
+    },
+    "RISK": {
+      "tables": {
+        "RISK_EVENTS": {
+          "description": "All risk incidents and loss events",
+          "file": "tables/RISK_EVENTS.json"
+        }
+      }
+    }
+  },
+  "relationships": [
+    {
+      "from": "COMPLIANCE_VIOLATIONS.DEPARTMENT",
+      "to": "AUDIT_FINDINGS.DEPARTMENT",
+      "description": "Join violations to audit findings by department"
+    },
+    {
+      "from": "COMPLIANCE_VIOLATIONS.DEPARTMENT",
+      "to": "RISK_EVENTS.DEPARTMENT",
+      "description": "Join violations to risk events by department"
+    },
+    {
+      "from": "AUDIT_FINDINGS.DEPARTMENT",
+      "to": "RISK_EVENTS.DEPARTMENT",
+      "description": "Join audit findings to risk events by department"
+    },
+    {
+      "from": "COMPLIANCE_VIOLATIONS.SOE_ID",
+      "to": "RISK_EVENTS.SOE_ID",
+      "description": "Join violations to risk events by employee SOE ID"
+    },
+    {
+      "from": "CONTROL_MAPPINGS.CONTROL_OWNER_DEPT",
+      "to": "COMPLIANCE_VIOLATIONS.DEPARTMENT",
+      "description": "Join controls to violations by owning department"
+    }
+  ]
+}

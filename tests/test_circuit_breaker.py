@@ -1,15 +1,16 @@
 """
 Unit tests for the circuit breaker.
 """
-import sys
 import os
+import sys
 import time
-import pytest
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "rag-system"))
+import pytest
 
-from circuit_breaker import CircuitBreaker, CircuitBreakerOpen, CircuitState
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "aria"))
+
+from circuit_breaker import CircuitBreaker, CircuitBreakerOpenError, CircuitState
 
 
 class TestCircuitBreakerClosed:
@@ -37,7 +38,7 @@ class TestCircuitBreakerClosed:
         assert cb.state == CircuitState.CLOSED
 
 
-class TestCircuitBreakerOpen:
+class TestCircuitBreakerOpenError:
     def test_opens_at_threshold(self):
         cb = CircuitBreaker("test", failure_threshold=3)
         cb.record_failure()
@@ -49,7 +50,7 @@ class TestCircuitBreakerOpen:
         cb = CircuitBreaker("test", failure_threshold=3, recovery_timeout=60.0)
         for _ in range(3):
             cb.record_failure()
-        with pytest.raises(CircuitBreakerOpen) as exc_info:
+        with pytest.raises(CircuitBreakerOpenError) as exc_info:
             cb.before_call()
         assert "test" in str(exc_info.value)
 
@@ -57,7 +58,7 @@ class TestCircuitBreakerOpen:
         cb = CircuitBreaker("test", failure_threshold=3, recovery_timeout=30.0)
         for _ in range(3):
             cb.record_failure()
-        with pytest.raises(CircuitBreakerOpen) as exc_info:
+        with pytest.raises(CircuitBreakerOpenError) as exc_info:
             cb.before_call()
         assert exc_info.value.time_until_retry <= 30.0
 
@@ -121,7 +122,7 @@ class TestCircuitBreakerIntegration:
 
         assert llm_circuit_breaker.state == CircuitState.OPEN
 
-        with pytest.raises(CircuitBreakerOpen):
+        with pytest.raises(CircuitBreakerOpenError):
             llm_circuit_breaker.before_call()
 
         llm_circuit_breaker.reset()

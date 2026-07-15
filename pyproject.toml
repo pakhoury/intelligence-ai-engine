@@ -1,13 +1,13 @@
 [project]
-name = "compliance-rag"
+name = "aria"
 version = "1.0.0"
-description = "Hybrid RAG system combining Oracle SQL and PGVector semantic search for compliance Q&A"
+description = "ARIA (Analytical Risk Intelligence Agent) — hybrid RAG platform combining Oracle SQL and PGVector semantic search for risk and compliance intelligence"
 requires-python = ">=3.11"
 
 [tool.ruff]
 target-version = "py311"
 line-length = 120
-src = ["src/rag-system", "tests"]
+src = ["src/aria", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -33,7 +33,7 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src/rag-system"]
+pythonpath = ["src/aria"]
 asyncio_mode = "auto"
 markers = [
     "integration: requires running infrastructure (Oracle, Postgres, Redis)",

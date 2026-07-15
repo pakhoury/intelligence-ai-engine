@@ -1,0 +1,25 @@
+{
+  "table": "COMPLIANCE_VIOLATIONS",
+  "schema": "COMPLIANCE",
+  "description": "Core table storing all compliance violations and regulatory breaches",
+  "columns": {
+    "VIOLATION_ID": "Unique identifier for each violation",
+    "SOE_ID": "Employee SOE ID who committed or is associated with the violation",
+    "EMPLOYEE_NAME": "Full name of the employee",
+    "DEPARTMENT": "Department where the employee belongs",
+    "VIOLATION_DATE": "Date when the violation occurred",
+    "VIOLATION_TYPE": "Type of violation (AML, KYC, Conflict of Interest, Data Privacy, etc.)",
+    "SEVERITY": "Severity level: Low, Medium, High, Critical",
+    "STATUS": "Current status: Open, In Progress, Closed, Escalated",
+    "CLOSURE_DATE": "Date when violation was closed",
+    "REGULATORY_BODY": "Regulatory body involved (RBI, SEBI, etc.)",
+    "FINANCIAL_IMPACT": "Financial penalty or loss amount in USD"
+  },
+  "categorical_columns": [
+    "VIOLATION_TYPE",
+    "SEVERITY",
+    "STATUS",
+    "DEPARTMENT",
+    "REGULATORY_BODY"
+  ]
+}

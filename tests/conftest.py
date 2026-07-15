@@ -1,13 +1,14 @@
 """
 Shared pytest fixtures for unit and integration tests.
 """
-import sys
 import os
-from unittest.mock import MagicMock, AsyncMock, patch
+import sys
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
-# Add src/rag-system to path so imports work
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "rag-system"))
+# Add src/aria to path so imports work
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "aria"))
 
 
 @pytest.fixture

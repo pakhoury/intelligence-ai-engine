@@ -1,0 +1,20 @@
+{
+  "table": "AUDIT_FINDINGS",
+  "schema": "COMPLIANCE",
+  "description": "Internal and external audit findings",
+  "columns": {
+    "FINDING_ID": "Unique audit finding ID",
+    "AUDIT_TYPE": "Internal Audit / External Audit / Regulatory Inspection",
+    "DEPARTMENT": "Audited department",
+    "FINDING_DATE": "Date finding was raised",
+    "DESCRIPTION": "Detailed description of the finding",
+    "RISK_RATING": "Risk rating: Low, Medium, High",
+    "STATUS": "Status of the finding"
+  },
+  "categorical_columns": [
+    "AUDIT_TYPE",
+    "DEPARTMENT",
+    "RISK_RATING",
+    "STATUS"
+  ]
+}

@@ -3,10 +3,10 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: "compliance-rag"
+  - job_name: "aria"
     metrics_path: /metrics
     static_configs:
       - targets: ["app:8000"]
         labels:
-          service: "compliance-rag"
+          service: "aria"
           environment: "production"

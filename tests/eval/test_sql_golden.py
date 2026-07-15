@@ -11,17 +11,18 @@ Run with: pytest tests/eval/test_sql_golden.py -v
 import json
 import os
 import sys
+
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src", "rag-system"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src", "aria"))
 
+from metrics.compiler import MetricCompiler
 from metrics.loader import load_metrics_catalog
 from metrics.resolver import MetricResolver
-from metrics.compiler import MetricCompiler
 
 GOLDEN_PATH = os.path.join(os.path.dirname(__file__), "sql_golden_set.json")
 
-with open(GOLDEN_PATH, "r", encoding="utf-8") as f:
+with open(GOLDEN_PATH, encoding="utf-8") as f:
     GOLDEN_DATA = json.load(f)
 
 GOLDEN_CASES = GOLDEN_DATA["cases"]

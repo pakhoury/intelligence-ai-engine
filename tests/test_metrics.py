@@ -7,24 +7,21 @@ same question + same metric definition = same SQL, every time.
 """
 import os
 import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "rag-system"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "aria"))
 
+from metrics.compiler import MetricCompiler, _sanitize_param
+from metrics.loader import load_metrics_catalog
 from metrics.registry import (
     MetricDefinition,
     MetricParameter,
     MetricRegistry,
     MetricSQL,
-    SQLFilter,
-    SQLOrderBy,
-    SQLSelectExpr,
 )
-from metrics.loader import load_metrics_catalog
-from metrics.resolver import MetricResolver, ResolvedMetric
-from metrics.compiler import MetricCompiler, CompiledSQL, _sanitize_param
-
+from metrics.resolver import MetricResolver
 
 # ═════════════════════════════════════════════════════════════════════════
 # Registry
@@ -542,8 +539,9 @@ class TestBuildAllContext:
         assert "AUDIT_FINDINGS" in ctx
 
     def test_empty_catalog_returns_empty(self):
-        from metrics import MetricsCatalog
         import tempfile
+
+        from metrics import MetricsCatalog
         path = os.path.join(tempfile.gettempdir(), "empty_metrics.yaml")
         with open(path, "w") as f:
             f.write("metrics: {}")

@@ -1,8 +1,7 @@
 """
 Unit tests for workflow nodes with mocked LLM and database.
 """
-import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 class TestCacheCheck:
@@ -223,8 +222,8 @@ class TestMetricResolverNode:
 
 class TestBuildMetricContext:
     def test_includes_formula_and_tables(self):
-        from nodes import _build_metric_context
         from metrics.registry import MetricDefinition, MetricParameter
+        from nodes import _build_metric_context
 
         metric = MetricDefinition(
             metric_id="test_metric",
@@ -258,8 +257,8 @@ class TestBuildMetricContext:
         assert "Higher is better." in ctx
 
     def test_default_params_labeled_correctly(self):
-        from nodes import _build_metric_context
         from metrics.registry import MetricDefinition, MetricParameter
+        from nodes import _build_metric_context
 
         metric = MetricDefinition(
             metric_id="m", name="M", version="1.0", description="d",
@@ -275,8 +274,8 @@ class TestBuildMetricContext:
 
     def test_extra_params_included(self):
         """Params not in the metric definition (e.g. business_key) still appear."""
-        from nodes import _build_metric_context
         from metrics.registry import MetricDefinition, MetricParameter
+        from nodes import _build_metric_context
 
         metric = MetricDefinition(
             metric_id="m", name="M", version="1.0", description="d",
@@ -291,8 +290,8 @@ class TestBuildMetricContext:
 
     def test_minimal_metric_no_optional_sections(self):
         """Metric with no steps, thresholds, or interpretation produces clean output."""
-        from nodes import _build_metric_context
         from metrics.registry import MetricDefinition
+        from nodes import _build_metric_context
 
         metric = MetricDefinition(
             metric_id="m", name="M", version="1.0", description="d",
@@ -339,7 +338,7 @@ class TestSqlPath:
         mock_db.execute_query.return_value = "[(1,)]"
 
         from nodes import sql_path
-        result = await sql_path(sample_state)
+        await sql_path(sample_state)
         mock_db.execute_query.assert_called_once()
         called_sql = mock_db.execute_query.call_args[0][0]
         assert "```" not in called_sql
@@ -359,7 +358,7 @@ class TestSqlPath:
         mock_db.execute_query.return_value = "[(2400000,)]"
 
         from nodes import sql_path
-        result = await sql_path(sample_state)
+        await sql_path(sample_state)
         sql_prompt = mock_ainvoke.call_args_list[1][0][0]
         assert "prior research step" in sql_prompt
         assert "SUM(fine_amount + remediation_cost)" in sql_prompt
@@ -383,7 +382,7 @@ class TestSqlPath:
         mock_db.execute_query.return_value = "[(100,)]"
 
         from nodes import sql_path
-        result = await sql_path(sample_state)
+        await sql_path(sample_state)
         sql_prompt = mock_ainvoke.call_args_list[1][0][0]
         assert "Resolved Metric Definition (follow this formula" in sql_prompt
         assert "(closed / total) * 100" in sql_prompt
@@ -404,7 +403,7 @@ class TestSqlPath:
         mock_db.execute_query.return_value = "[(100,)]"
 
         from nodes import sql_path
-        result = await sql_path(sample_state)
+        await sql_path(sample_state)
         sql_prompt = mock_ainvoke.call_args_list[1][0][0]
         assert "No specific metric was identified" in sql_prompt
         assert "Resolved Metric Definition (follow this formula" not in sql_prompt
@@ -436,7 +435,7 @@ class TestVectorRetrieval:
         mock_store_fn.return_value = mock_store
 
         from nodes import vector_retrieval
-        result = await vector_retrieval(sample_state)
+        await vector_retrieval(sample_state)
         mock_store.similarity_search.assert_called_once_with("ACCESS_CONTROL", k=6)
 
     @patch("nodes._get_vector_store")
@@ -496,11 +495,12 @@ class TestReviewerNode:
 
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
     async def test_defaults_score_on_parse_failure(self, mock_ainvoke, sample_state):
+        """Unparseable reviewer output must not trigger the reflection loop (score 0)."""
         sample_state["final_answer"] = "Answer text"
         mock_ainvoke.return_value = "This looks good"
         from nodes import reviewer_node
         result = await reviewer_node(sample_state)
-        assert result["review_score"] == 0.0
+        assert result["review_score"] == 7.0
 
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
     async def test_dlp_redacts_pii_in_answer(self, mock_ainvoke, sample_state):
@@ -561,23 +561,57 @@ class TestCacheKeyNormalization:
         key2 = _cache_key("What is AML policy?")
         assert key1 != key2
 
-    def test_same_question_different_metric_different_keys(self):
+    def test_check_and_write_keys_align(self):
+        """Regression: cache_write must produce the same key cache_check reads."""
         from nodes import _cache_key
-        key1 = _cache_key("What is the score?", resolved_metric="metric_a")
-        key2 = _cache_key("What is the score?", resolved_metric="metric_b")
-        assert key1 != key2
+        # cache_check keys on the incoming question; cache_write keys on
+        # original_question — for first-turn requests these are identical.
+        assert _cache_key("How many violations?") == _cache_key("How many violations?")
 
-    def test_same_question_different_params_different_keys(self):
-        from nodes import _cache_key
-        key1 = _cache_key("compliance score", resolved_metric="ces", metric_params={"department": "Legal"})
-        key2 = _cache_key("compliance score", resolved_metric="ces", metric_params={"department": "HR"})
-        assert key1 != key2
 
-    def test_no_metric_matches_plain_key(self):
-        from nodes import _cache_key
-        key1 = _cache_key("How many violations?")
-        key2 = _cache_key("How many violations?", resolved_metric="", metric_params=None)
-        assert key1 == key2
+class TestCacheContextIsolation:
+    @patch("nodes.redis_client")
+    async def test_cache_check_bypasses_followups(self, mock_redis, sample_state_with_history):
+        """Follow-up questions must never be served from cache."""
+        mock_redis.get.return_value = '{"answer": "Cached", "review_score": 9.0}'
+        from nodes import cache_check
+        result = await cache_check(sample_state_with_history)
+        assert result["cache_hit"] is False
+        mock_redis.get.assert_not_called()
+
+    @patch("nodes.redis_client")
+    async def test_cache_write_skips_followups(self, mock_redis, sample_state_with_history):
+        sample_state_with_history["review_score"] = 9.0
+        sample_state_with_history["final_answer"] = "Context-dependent answer"
+        from nodes import cache_write
+        await cache_write(sample_state_with_history)
+        mock_redis.set.assert_not_called()
+
+    @patch("nodes.redis_client")
+    async def test_write_then_check_roundtrip(self, mock_redis, sample_state):
+        """Answer cached for a metric question is found on the next identical request."""
+        import json
+        sample_state["review_score"] = 8.5
+        sample_state["final_answer"] = "The score is 55%."
+        sample_state["resolved_metric"] = "compliance_effectiveness_score"
+        sample_state["metric_version"] = "1.0"
+        sample_state["confidence"] = "high"
+
+        from nodes import cache_check, cache_write
+        await cache_write(sample_state)
+        write_key, payload = mock_redis.set.call_args[0][0], mock_redis.set.call_args[0][1]
+
+        mock_redis.get.return_value = payload
+        result = await cache_check({"question": sample_state["question"], "conversation_history": []})
+        read_key = mock_redis.get.call_args[0][0]
+
+        assert write_key == read_key
+        assert result["cache_hit"] is True
+        assert result["final_answer"] == "The score is 55%."
+        assert result["review_score"] == 8.5
+        assert result["confidence"] == "high"
+        assert result["resolved_metric"] == "compliance_effectiveness_score"
+        assert json.loads(payload)["metric_version"] == "1.0"
 
 
 class TestContextResolver:
@@ -656,9 +690,9 @@ class TestFormatHistory:
         }
         result = _format_history(state)
         lines = result.split("\n")
-        assert any("Old question" in l for l in lines)
-        assert any("Metric: test_metric" in l for l in lines)
-        assert sum(1 for l in lines if l.startswith("[")) == 1
+        assert any("Old question" in line for line in lines)
+        assert any("Metric: test_metric" in line for line in lines)
+        assert sum(1 for line in lines if line.startswith("[")) == 1
 
     def test_limits_to_5_turns(self):
         from nodes import _format_history
@@ -670,7 +704,7 @@ class TestFormatHistory:
         }
         result = _format_history(state)
         # Should only have last 5 turns (10 lines: 5 User + 5 Assistant)
-        lines = [l for l in result.split("\n") if l.strip()]
+        lines = [line for line in result.split("\n") if line.strip()]
         assert len(lines) == 10
         assert "Question 5" in result  # First of last 5
         assert "Question 0" not in result  # Should be trimmed

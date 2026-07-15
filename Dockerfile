@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /install /usr/local
 
 # Copy application code
-COPY src/rag-system/ .
+COPY src/aria/ .
 COPY documents/ ./documents/
 COPY metadata_mapping.json .
 

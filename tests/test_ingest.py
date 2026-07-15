@@ -1,9 +1,6 @@
 """Tests for the Excel ingestion logic in ingest.py."""
-import os
-import tempfile
-import pytest
 import openpyxl
-from langchain_core.documents import Document
+import pytest
 
 
 def _create_test_excel(path, sheets: dict):
@@ -94,7 +91,6 @@ class TestLoadExcelFiles:
         assert "Col1: A" in sparse_docs[0].page_content
 
     def test_handles_missing_openpyxl_gracefully(self, excel_dir, monkeypatch):
-        import importlib
         import ingest.ingest as ingest_mod
 
         original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__

@@ -1,4 +1,4 @@
-# Intelligence AI Engine
+# ARIA — Analytical Risk Intelligence Agent
 
 A federated Retrieval-Augmented Generation platform that answers compliance and risk questions by combining **structured data** (Oracle SQL) with **unstructured knowledge** (document semantic search). The system classifies each question, selects an execution strategy, chains data sources when needed, compiles deterministic SQL for registered metrics, synthesizes an answer, and validates it through 5 deterministic validators + an LLM reviewer before caching.
 
@@ -22,7 +22,7 @@ This system solves that with a **strategy-based hybrid pipeline**: an LLM classi
 | Model fallback chain | Primary LLM (llama-3.3-70b) + fallback (llama-3.1-8b). Circuit breaker triggers automatic fallback. | Fallback model is smaller (lower quality), but service stays up. |
 | 5 deterministic validators | SQL safety, result sanity, answer grounding, number grounding, metric citation — each with independent score caps. | Adds review latency, but catches failures LLM reviewer misses. |
 | Confidence scoring | `high/medium/low` computed from: compiled vs LLM path, review score, validator failures. | Requires tuning thresholds, but gives users actionable trust signal. |
-| Enriched cache keys | `question + resolved_metric + params` prevents parameter collisions. | Metric queries have lower cache hit rate, but no stale answers. |
+| First-turn-only caching | Cache keyed on normalized question text; follow-ups (any request with history) bypass the cache entirely. Cached payload stores answer + review score + confidence + metric metadata. | Follow-ups never benefit from cache, but context-dependent answers can never leak across sessions. |
 | MemorySaver fatal in production | PostgreSQL checkpointer failure raises `RuntimeError` unless `ENVIRONMENT=development`. | Crashes the app on PG failure, but audit trail loss is unacceptable for compliance. |
 | SQL validation + retry loop | Column references validated against catalog pre-execution. Errors fed back to LLM (up to 2 retries). | Adds latency on malformed queries, but prevents cryptic Oracle errors. |
 | Metadata-filtered vector retrieval | PGVector JSONB filtering by `doc_type`/`category` based on route. k=6 for broader recall. | Route-based heuristic may miss edge cases, but precision improves significantly at scale. |
@@ -275,7 +275,7 @@ intelligence-ai-engine/
 ├── requirement.txt
 ├── .env                            # Runtime config (API keys, DB credentials)
 │
-├── src/rag-system/
+├── src/aria/
 │   ├── main.py                     # FastAPI: /query, /health, /ready, /metrics, /audit
 │   ├── config.py                   # LLM (primary + fallback), DB, Redis init
 │   ├── workflow.py                 # LangGraph: 11 nodes, 5 strategies, reflection
@@ -535,7 +535,7 @@ pytest tests/ -v    # All tests, no infrastructure required
 ### CI Pipeline
 
 GitHub Actions on every push to `main`/`develop`:
-1. **Lint** — `ruff check src/rag-system/ tests/`
+1. **Lint** — `ruff check src/aria/ tests/`
 2. **Test** — `pytest tests/` with 60% minimum coverage
 3. **Docker build** — builds image and verifies it starts
 

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check src/aria/ tests/
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          pip install -r requirement.txt
+          pip install pytest pytest-asyncio pytest-cov
+      - name: Run unit tests
+        run: |
+          pytest tests/ \
+            -v --tb=short \
+            --cov=src/aria \
+            --cov-report=term-missing \
+            --cov-fail-under=60
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t aria:test .
+      - name: Verify image starts
+        run: |
+          docker run -d --name test-app -p 8000:8000 \
+            -e REDIS_HOST=localhost \
+            -e POSTGRES_HOST=localhost \
+            -e ORACLE_HOST=localhost \
+            aria:test
+          healthy=""
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health; then
+              healthy=1
+              break
+            fi
+            sleep 3
+          done
+          docker logs test-app
+          if [ -z "$healthy" ]; then
+            echo "::error::App did not become healthy within 90s"
+            exit 1
+          fi
+          docker stop test-app

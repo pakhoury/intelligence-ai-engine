@@ -1,19 +1,18 @@
 """
 Unit tests for deterministic validators.
 """
-import sys
 import os
-import pytest
+import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "rag-system"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "aria"))
 
 from validators import (
-    validate_sql_safety,
-    validate_result_sanity,
-    validate_answer_grounding,
-    validate_number_grounding,
-    validate_metric_citation,
     run_all_validators,
+    validate_answer_grounding,
+    validate_metric_citation,
+    validate_number_grounding,
+    validate_result_sanity,
+    validate_sql_safety,
 )
 
 
@@ -105,9 +104,15 @@ class TestResultSanity:
         assert result.score_cap <= 6.0
 
     def test_suspiciously_large_number(self):
-        result = validate_result_sanity("[(99999999999,)]")
+        # >= 10^16 flags (cartesian-join scale); legitimate financial
+        # aggregates in the billions/trillions must NOT flag.
+        result = validate_result_sanity("[(99999999999999999,)]")
         assert not result.passed
         assert any("large number" in f.lower() for f in result.failures)
+
+    def test_billions_are_legitimate(self):
+        result = validate_result_sanity("[('total_penalties', 99999999999)]")
+        assert result.passed
 
     def test_na_passes(self):
         result = validate_result_sanity("N/A - no SQL data retrieved")

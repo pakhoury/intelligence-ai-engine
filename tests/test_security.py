@@ -1,9 +1,10 @@
 """
 Unit tests for the security module.
 """
-import pytest
 import os
 from unittest.mock import patch
+
+import pytest
 from fastapi import HTTPException
 
 
@@ -87,8 +88,8 @@ class TestAPIKeyAuth:
     @patch.dict(os.environ, {"API_KEYS": "key1,key2,key3"})
     @pytest.mark.asyncio
     async def test_valid_key_accepted(self):
-        from security import verify_api_key, _valid_keys
         import security
+        from security import verify_api_key
         security._valid_keys = None  # Reset cache
         result = await verify_api_key("key1")
         assert result  # Returns hash of key
@@ -96,8 +97,8 @@ class TestAPIKeyAuth:
     @patch.dict(os.environ, {"API_KEYS": "key1,key2"})
     @pytest.mark.asyncio
     async def test_invalid_key_rejected(self):
-        from security import verify_api_key
         import security
+        from security import verify_api_key
         security._valid_keys = None
         with pytest.raises(HTTPException) as exc:
             await verify_api_key("wrong_key")
@@ -106,21 +107,32 @@ class TestAPIKeyAuth:
     @patch.dict(os.environ, {"API_KEYS": "key1"})
     @pytest.mark.asyncio
     async def test_missing_key_rejected(self):
-        from security import verify_api_key
         import security
+        from security import verify_api_key
         security._valid_keys = None
         with pytest.raises(HTTPException) as exc:
             await verify_api_key(None)
         assert exc.value.status_code == 401
 
-    @patch.dict(os.environ, {"API_KEYS": ""})
+    @patch.dict(os.environ, {"API_KEYS": "", "ENVIRONMENT": "development"})
     @pytest.mark.asyncio
-    async def test_no_keys_configured_allows_all(self):
-        from security import verify_api_key
+    async def test_no_keys_configured_allows_all_in_dev(self):
         import security
+        from security import verify_api_key
         security._valid_keys = None
         result = await verify_api_key(None)
         assert result == "dev-no-auth"
+
+    @patch.dict(os.environ, {"API_KEYS": "", "ENVIRONMENT": "production"})
+    @pytest.mark.asyncio
+    async def test_no_keys_in_production_fails_closed(self):
+        """Missing API_KEYS outside development must reject, never fail open."""
+        import security
+        from security import verify_api_key
+        security._valid_keys = None
+        with pytest.raises(HTTPException) as exc:
+            await verify_api_key("any-key")
+        assert exc.value.status_code == 503
 
 
 class TestSQLValidation:
@@ -201,6 +213,17 @@ class TestPIIRedaction:
         assert "[EMAIL]" in result
         assert "[SSN]" in result
         assert "j@test.com" not in result
+
+    def test_preserves_bare_numeric_ids(self):
+        """Record IDs and timestamps must not be corrupted into [PHONE]/[SSN]/[CARD_NUMBER]."""
+        from security import redact_pii
+        text = "Record 4155551234 filed under case 123456789 at 20240115083000."
+        assert redact_pii(text) == text
+
+    def test_luhn_invalid_long_number_preserved(self):
+        from security import redact_pii
+        text = "Transaction ID 9999999999999999 processed."
+        assert redact_pii(text) == text
 
 
 class TestDLPScan:

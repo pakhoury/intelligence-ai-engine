@@ -1,0 +1,18 @@
+{
+  "table": "RISK_EVENTS",
+  "schema": "RISK",
+  "description": "All risk incidents and loss events",
+  "columns": {
+    "EVENT_ID": "Unique risk event ID",
+    "SOE_ID": "Employee SOE ID",
+    "DEPARTMENT": "Department",
+    "EVENT_DATE": "Date of risk event",
+    "RISK_CATEGORY": "Risk category (Operational, Credit, Market, etc.)",
+    "LOSS_AMOUNT": "Financial loss amount",
+    "EVENT_DESCRIPTION": "Description of the event"
+  },
+  "categorical_columns": [
+    "DEPARTMENT",
+    "RISK_CATEGORY"
+  ]
+}

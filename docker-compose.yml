@@ -57,7 +57,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./src/rag-system:/app
+      - ./src/aria:/app
     depends_on:
       oracle:
         condition: service_healthy
@@ -67,6 +67,7 @@ services:
         condition: service_started
     environment:
       - REDIS_HOST=redis
+      - RATE_LIMIT_REDIS_URL=redis://redis:6379/1
       - POSTGRES_HOST=postgres
       - ORACLE_USER=compliance_user
       - ORACLE_PASSWORD=compliance_pass

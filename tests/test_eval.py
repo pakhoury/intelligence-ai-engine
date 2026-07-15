@@ -10,17 +10,18 @@ Run with: pytest tests/test_eval.py -v
 """
 import os
 import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 import yaml
-from unittest.mock import MagicMock, AsyncMock, patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "rag-system"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "aria"))
 
 GOLDEN_PATH = os.path.join(os.path.dirname(__file__), "golden_dataset.yaml")
 
 
 def load_golden_cases():
-    with open(GOLDEN_PATH, "r", encoding="utf-8") as f:
+    with open(GOLDEN_PATH, encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data["cases"]
 

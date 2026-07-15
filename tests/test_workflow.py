@@ -2,8 +2,9 @@
 Integration tests for the LangGraph workflow — verifies conditional routing,
 chained strategies, and reflection loop with all external dependencies mocked.
 """
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
 
 
 @pytest.fixture

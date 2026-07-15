@@ -1,0 +1,18 @@
+{
+  "table": "CONTROL_MAPPINGS",
+  "schema": "COMPLIANCE",
+  "description": "Mapping between controls and compliance requirements",
+  "columns": {
+    "CONTROL_ID": "Unique control identifier",
+    "CONTROL_NAME": "Name of the control",
+    "CONTROL_OWNER_DEPT": "Department that owns the control",
+    "COMPLIANCE_REQUIREMENT": "Related compliance or regulation",
+    "EFFECTIVE_DATE": "Date control became effective",
+    "TEST_FREQUENCY": "How often the control is tested"
+  },
+  "categorical_columns": [
+    "CONTROL_OWNER_DEPT",
+    "COMPLIANCE_REQUIREMENT",
+    "TEST_FREQUENCY"
+  ]
+}
