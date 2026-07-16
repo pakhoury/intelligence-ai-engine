@@ -1,6 +1,6 @@
 # ARIA — Analytical Risk Intelligence Agent
 
-A federated Retrieval-Augmented Generation platform that answers compliance and risk questions by combining **structured data** (Oracle SQL) with **unstructured knowledge** (document semantic search). The system classifies each question, selects an execution strategy, chains data sources when needed, compiles deterministic SQL for registered metrics, synthesizes an answer, and validates it through 5 deterministic validators + an LLM reviewer before caching.
+A federated Retrieval-Augmented Generation platform that answers compliance and risk questions by combining **structured data** (Oracle SQL) with **unstructured knowledge** (hybrid document search: pgvector semantic + Postgres full-text, fused with Reciprocal Rank Fusion). The system classifies each question, selects an execution strategy, chains data sources when needed, compiles deterministic SQL for registered metrics, synthesizes an answer, and validates it through 5 deterministic validators + an LLM reviewer before caching.
 
 Built for regulated financial services where answers must be grounded, auditable, and reproducible.
 
@@ -25,7 +25,7 @@ This system solves that with a **strategy-based hybrid pipeline**: an LLM classi
 | First-turn-only caching | Cache keyed on normalized question text; follow-ups (any request with history) bypass the cache entirely. Cached payload stores answer + review score + confidence + metric metadata. | Follow-ups never benefit from cache, but context-dependent answers can never leak across sessions. |
 | MemorySaver fatal in production | PostgreSQL checkpointer failure raises `RuntimeError` unless `ENVIRONMENT=development`. | Crashes the app on PG failure, but audit trail loss is unacceptable for compliance. |
 | SQL validation + retry loop | Column references validated against catalog pre-execution. Errors fed back to LLM (up to 2 retries). | Adds latency on malformed queries, but prevents cryptic Oracle errors. |
-| Metadata-filtered vector retrieval | PGVector JSONB filtering by `doc_type`/`category` based on route. k=6 for broader recall. | Route-based heuristic may miss edge cases, but precision improves significantly at scale. |
+| Hybrid retrieval (vector + full-text, RRF fusion) | Embeddings miss exact identifiers (incident IDs, violation codes); Postgres full-text misses paraphrase. Both run concurrently (k=20 each), fused by Reciprocal Rank Fusion to top-6. Metadata (`doc_type`) filters apply to both sides. | One extra query per retrieval, but exact-ID questions ("incident SOE-45678") retrieve the right chunk. Lexical failure degrades gracefully to vector-only. |
 | Persistent PostgreSQL checkpointer | LangGraph state stored in PostgreSQL, surviving restarts. | Requires PG dependency, but enables regulatory audit trails. |
 | Non-blocking Redis via `asyncio.to_thread` | Cache, history operations run in background threads. | Thread pool overhead, but consistent with Oracle call pattern. |
 | Request-level timeout | `asyncio.wait_for` with configurable timeout (default 60s). Returns 504 on hang. | Kills slow queries, but prevents unbounded resource consumption. |

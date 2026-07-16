@@ -143,6 +143,15 @@ def main():
         use_jsonb=True,
     )
 
+    # Full-text (GIN) index over the chunk table for hybrid lexical search
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from sqlalchemy import create_engine
+
+    from retrieval import ensure_fulltext_index
+    ensure_fulltext_index(create_engine(connection_string))
+    print("Full-text search index ensured (hybrid retrieval ready)")
+
     print(f"\nSUCCESS: {len(chunks)} chunks stored in vector database.")
     print(f"  PDF chunks: {len([c for c in chunks if c.metadata.get('file_type') != 'excel'])}")
     print(f"  Excel chunks: {len([c for c in chunks if c.metadata.get('file_type') == 'excel'])}")

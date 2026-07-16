@@ -16,10 +16,17 @@ from metrics.llm_resolver import LLMMetricResolver
 from metrics.loader import load_metrics_catalog
 from metrics.registry import MetricDefinition
 from observability import CACHE_OPS, REFLECTION_COUNT, REVIEW_SCORE, ROUTE_COUNT, NodeTimer, logger
+from retrieval import lexical_search, rrf_fuse
 from security import dlp_scan, redact_pii, sanitize_for_prompt
 from validators import run_all_validators, validate_sql_safety
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+COLLECTION_NAME = "compliance_docs"
+
+# Hybrid retrieval: candidates fetched per retriever before fusion, and the
+# final number of chunks passed downstream after RRF.
+RETRIEVAL_CANDIDATES = 20
+RETRIEVAL_TOP_N = 6
 
 _metric_resolver: LLMMetricResolver | None = None
 _metric_registry = None
@@ -50,21 +57,36 @@ def _get_embeddings() -> HuggingFaceEmbeddings:
     return _embeddings
 
 
+def _pg_connection_string() -> str:
+    pg_user = os.getenv("POSTGRES_USER", "postgres")
+    pg_password = os.getenv("POSTGRES_PASSWORD", "postgres")
+    pg_host = os.getenv("POSTGRES_HOST", "localhost")
+    pg_db = os.getenv("POSTGRES_DB", "rag_db")
+    return f"postgresql+psycopg://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
+
+
 def _get_vector_store() -> PGVector:
     global _vector_store
     if _vector_store is None:
-        pg_user = os.getenv("POSTGRES_USER", "postgres")
-        pg_password = os.getenv("POSTGRES_PASSWORD", "postgres")
-        pg_host = os.getenv("POSTGRES_HOST", "localhost")
-        pg_db = os.getenv("POSTGRES_DB", "rag_db")
-        connection = f"postgresql+psycopg://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
         _vector_store = PGVector(
-            collection_name="compliance_docs",
-            connection_string=connection,
+            collection_name=COLLECTION_NAME,
+            connection_string=_pg_connection_string(),
             embedding_function=_get_embeddings(),
             use_jsonb=True,
         )
     return _vector_store
+
+
+_pg_engine = None
+
+
+def _get_pg_engine():
+    """Lazy SQLAlchemy engine for lexical (full-text) queries."""
+    global _pg_engine
+    if _pg_engine is None:
+        from sqlalchemy import create_engine
+        _pg_engine = create_engine(_pg_connection_string(), pool_size=5, max_overflow=5)
+    return _pg_engine
 
 
 def _format_history(state: dict) -> str:
@@ -586,35 +608,71 @@ def _build_doc_filter(state: dict) -> dict:
 
 
 async def vector_retrieval(state: dict):
+    """Hybrid retrieval: vector similarity + Postgres full-text, fused with RRF.
+
+    Embeddings handle paraphrase; full-text handles exact identifiers
+    (incident IDs, violation codes, regulation sections) that carry no
+    embedding signal. Either retriever failing degrades gracefully to the
+    other; both failing returns no docs, as before.
+    """
     with NodeTimer("vector_retrieval"):
         question = state["question"]
         extracted = state.get("extracted_context")
         search_query = extracted if extracted else question
         logger.info(f"Searching documents for: {search_query}", extra={"node": "vector_retrieval"})
 
-        try:
-            store = _get_vector_store()
-            metadata_filter = _build_doc_filter(state)
-            search_kwargs = {"k": 6}
-            if metadata_filter:
-                search_kwargs["filter"] = metadata_filter
-                logger.info(
-                    f"Applying doc filter: {metadata_filter}",
-                    extra={"node": "vector_retrieval", "filter": str(metadata_filter)},
-                )
-
-            results = await asyncio.to_thread(
-                store.similarity_search, search_query, **search_kwargs,
+        metadata_filter = _build_doc_filter(state)
+        search_kwargs = {"k": RETRIEVAL_CANDIDATES}
+        if metadata_filter:
+            search_kwargs["filter"] = metadata_filter
+            logger.info(
+                f"Applying doc filter: {metadata_filter}",
+                extra={"node": "vector_retrieval", "filter": str(metadata_filter)},
             )
-            docs = []
-            for doc in results:
-                source = doc.metadata.get("title", doc.metadata.get("source", "Unknown"))
-                docs.append(f"[{source}]: {doc.page_content}")
-            logger.info(f"Found {len(docs)} relevant chunks", extra={"node": "vector_retrieval"})
-            return {"retrieved_docs": docs}
-        except Exception as e:
-            logger.error(f"Vector retrieval failed: {e}", extra={"node": "vector_retrieval", "error": str(e)})
-            return {"retrieved_docs": []}
+
+        async def _vector():
+            store = _get_vector_store()
+            return await asyncio.to_thread(store.similarity_search, search_query, **search_kwargs)
+
+        async def _lexical():
+            return await asyncio.to_thread(
+                lexical_search,
+                _get_pg_engine(),
+                search_query,
+                COLLECTION_NAME,
+                RETRIEVAL_CANDIDATES,
+                metadata_filter.get("doc_type"),
+            )
+
+        vector_results, lexical_results = await asyncio.gather(
+            _vector(), _lexical(), return_exceptions=True,
+        )
+
+        if isinstance(vector_results, BaseException):
+            logger.error(
+                f"Vector retrieval failed: {vector_results}",
+                extra={"node": "vector_retrieval", "error": str(vector_results)},
+            )
+            vector_results = []
+        if isinstance(lexical_results, BaseException):
+            logger.warning(
+                f"Lexical retrieval failed, using vector-only: {lexical_results}",
+                extra={"node": "vector_retrieval", "error": str(lexical_results)},
+            )
+            lexical_results = []
+
+        fused = rrf_fuse([vector_results, lexical_results], top_n=RETRIEVAL_TOP_N)
+
+        docs = []
+        for doc in fused:
+            source = doc.metadata.get("title", doc.metadata.get("source", "Unknown"))
+            docs.append(f"[{source}]: {doc.page_content}")
+        logger.info(
+            f"Hybrid retrieval: {len(vector_results)} vector + {len(lexical_results)} lexical "
+            f"-> {len(docs)} fused chunks",
+            extra={"node": "vector_retrieval"},
+        )
+        return {"retrieved_docs": docs}
 
 
 async def answer_generator(state: dict):

@@ -108,6 +108,7 @@ def workflow_mocks(request):
         patch("nodes._ainvoke_llm", new_callable=AsyncMock) as mock_ainvoke,
         patch("nodes.db_connector") as mock_db,
         patch("nodes._get_vector_store") as mock_vs_fn,
+        patch("nodes.lexical_search", return_value=[]),
         patch("nodes._get_metric_resolver") as mock_resolver_fn,
     ):
         mock_resolver = MagicMock()

@@ -410,8 +410,9 @@ class TestSqlPath:
 
 
 class TestVectorRetrieval:
+    @patch("nodes.lexical_search", return_value=[])
     @patch("nodes._get_vector_store")
-    async def test_retrieves_documents(self, mock_store_fn, sample_state):
+    async def test_retrieves_documents(self, mock_store_fn, mock_lexical, sample_state):
         mock_doc = MagicMock()
         mock_doc.metadata = {"title": "Compliance Policy 2024"}
         mock_doc.page_content = "KYC requirements state that..."
@@ -424,8 +425,9 @@ class TestVectorRetrieval:
         assert len(result["retrieved_docs"]) == 1
         assert "KYC" in result["retrieved_docs"][0]
 
+    @patch("nodes.lexical_search", return_value=[])
     @patch("nodes._get_vector_store")
-    async def test_uses_extracted_context_for_search(self, mock_store_fn, sample_state):
+    async def test_uses_extracted_context_for_search(self, mock_store_fn, mock_lexical, sample_state):
         sample_state["extracted_context"] = "ACCESS_CONTROL"
         mock_doc = MagicMock()
         mock_doc.metadata = {"title": "Access Control Policy"}
@@ -434,12 +436,15 @@ class TestVectorRetrieval:
         mock_store.similarity_search.return_value = [mock_doc]
         mock_store_fn.return_value = mock_store
 
-        from nodes import vector_retrieval
+        from nodes import RETRIEVAL_CANDIDATES, vector_retrieval
         await vector_retrieval(sample_state)
-        mock_store.similarity_search.assert_called_once_with("ACCESS_CONTROL", k=6)
+        mock_store.similarity_search.assert_called_once_with("ACCESS_CONTROL", k=RETRIEVAL_CANDIDATES)
+        # Lexical side also searches with the extracted context
+        assert mock_lexical.call_args[0][1] == "ACCESS_CONTROL"
 
+    @patch("nodes.lexical_search", return_value=[])
     @patch("nodes._get_vector_store")
-    async def test_handles_pgvector_error(self, mock_store_fn, sample_state):
+    async def test_handles_pgvector_error(self, mock_store_fn, mock_lexical, sample_state):
         mock_store_fn.side_effect = Exception("PGVector connection failed")
 
         from nodes import vector_retrieval

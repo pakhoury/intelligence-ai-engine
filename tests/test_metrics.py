@@ -562,9 +562,10 @@ class TestResolvedMetricUsesCompiler:
     @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
     @patch("nodes.db_connector")
     @patch("nodes._get_vector_store")
+    @patch("nodes.lexical_search", return_value=[])
     @patch("nodes._get_metric_resolver")
     async def test_compiled_metric_skips_llm_sql(
-        self, mock_resolver_fn,
+        self, mock_resolver_fn, mock_lexical,
         mock_vs_fn, mock_db,
         mock_ainvoke, mock_redis,
     ):
