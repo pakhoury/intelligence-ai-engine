@@ -70,6 +70,10 @@ class OracleConnector(DatabaseConnector):
             )
             return f"Execution Error: {str(e)}"
 
+    def get_allowed_tables(self) -> set[str]:
+        # DUAL is Oracle's built-in one-row table, needed for scalar queries.
+        return super().get_allowed_tables() | {"DUAL"}
+
     def get_dialect(self) -> str:
         return "oracle"
 

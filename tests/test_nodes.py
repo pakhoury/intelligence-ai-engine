@@ -528,6 +528,44 @@ class TestReviewerNode:
         assert "final_answer" not in result
         assert result["review_score"] == 9.0
 
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_skips_reflection_on_sql_execution_error(self, mock_ainvoke, sample_state):
+        """A SQL execution error can't be fixed by regenerating the answer."""
+        sample_state["final_answer"] = "I was unable to retrieve the requested data."
+        sample_state["sql_result"] = "Execution Error: ORA-00942: table or view does not exist"
+        sample_state["route"] = "docs_then_sql"
+        sample_state["retrieved_docs"] = ["[Policy]: KYC thresholds apply."]
+        mock_ainvoke.return_value = "Score: 9.0\nDecision: APPROVED"
+        from nodes import reviewer_node
+        result = await reviewer_node(sample_state)
+        assert result["skip_reflection"] is True
+        assert result["review_score"] <= 3.0
+
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_no_skip_on_clean_answer(self, mock_ainvoke, sample_state):
+        sample_state["final_answer"] = "There are 2 critical violations."
+        sample_state["sql_result"] = "Query:\nSELECT...\n\nResult:\n[('Critical', 2)]"
+        sample_state["route"] = "sql_only"
+        mock_ainvoke.return_value = "Score: 9.0\nDecision: APPROVED"
+        from nodes import reviewer_node
+        result = await reviewer_node(sample_state)
+        assert result["skip_reflection"] is False
+
+    @patch("nodes._ainvoke_llm", new_callable=AsyncMock)
+    async def test_no_skip_on_answer_level_failure(self, mock_ainvoke, sample_state):
+        """Failures in the answer text (missing metric citation) stay in the loop —
+        a regenerated answer can fix them."""
+        sample_state["final_answer"] = "The value is 42."
+        sample_state["sql_result"] = "Query:\nSELECT...\n\nResult:\n[(42,)]"
+        sample_state["route"] = "sql_only"
+        sample_state["resolved_metric"] = "compliance_effectiveness_score"
+        sample_state["compiled_metric"] = True
+        mock_ainvoke.return_value = "Score: 9.0\nDecision: APPROVED"
+        from nodes import reviewer_node
+        result = await reviewer_node(sample_state)
+        assert result["skip_reflection"] is False
+        assert result["review_score"] <= 6.0
+
 
 class TestCacheWrite:
     @patch("nodes.redis_client")
@@ -545,6 +583,84 @@ class TestCacheWrite:
         from nodes import cache_write
         await cache_write(sample_state)
         mock_redis.set.assert_not_called()
+
+
+class TestExploratoryLabeling:
+    """Answers whose numbers came from LLM-generated SQL (not a compiled
+    metric) must carry an explicit exploratory-path disclosure."""
+
+    @patch("nodes.redis_client")
+    async def test_llm_sql_answer_gets_labeled(self, mock_redis, sample_state):
+        import json
+        sample_state["review_score"] = 9.0
+        sample_state["final_answer"] = "There are 48 open violations."
+        sample_state["sql_result"] = "Query:\nSELECT COUNT(*)...\n\nResult:\n[(48,)]"
+        sample_state["compiled_metric"] = False
+        from nodes import EXPLORATORY_NOTICE, cache_write
+        result = await cache_write(sample_state)
+        assert result["data_path"] == "exploratory"
+        assert result["final_answer"].endswith(EXPLORATORY_NOTICE)
+        # The labeled answer is what gets cached, so cache hits carry it too.
+        cached = json.loads(mock_redis.set.call_args[0][1])
+        assert cached["answer"].endswith(EXPLORATORY_NOTICE)
+        assert cached["data_path"] == "exploratory"
+
+    @patch("nodes.redis_client")
+    async def test_compiled_metric_answer_not_labeled(self, mock_redis, sample_state):
+        sample_state["review_score"] = 9.0
+        sample_state["final_answer"] = "The score is 55%."
+        sample_state["sql_result"] = "Query:\nSELECT...\n\nResult:\n[(55.0,)]"
+        sample_state["compiled_metric"] = True
+        from nodes import EXPLORATORY_NOTICE, cache_write
+        result = await cache_write(sample_state)
+        assert result["data_path"] == "governed"
+        assert "final_answer" not in result  # answer untouched
+        assert EXPLORATORY_NOTICE not in mock_redis.set.call_args[0][1]
+
+    @patch("nodes.redis_client")
+    async def test_docs_only_answer_not_labeled(self, mock_redis, sample_state):
+        sample_state["review_score"] = 9.0
+        sample_state["final_answer"] = "The AML policy requires KYC checks."
+        sample_state["retrieved_docs"] = ["[Policy]: KYC checks are required."]
+        from nodes import cache_write
+        result = await cache_write(sample_state)
+        assert result["data_path"] == "documents"
+        assert "final_answer" not in result
+
+    @patch("nodes.redis_client")
+    async def test_failed_sql_not_labeled_exploratory(self, mock_redis, sample_state):
+        sample_state["review_score"] = 9.0
+        sample_state["final_answer"] = "I could not retrieve the data."
+        sample_state["sql_result"] = "Execution Error: ORA-00942"
+        from nodes import cache_write
+        result = await cache_write(sample_state)
+        assert result["data_path"] == "none"
+        assert "final_answer" not in result
+
+    @patch("nodes.redis_client")
+    async def test_followup_answer_still_labeled(self, mock_redis, sample_state_with_history):
+        """Follow-ups bypass the cache but must still carry the disclosure."""
+        sample_state_with_history["review_score"] = 9.0
+        sample_state_with_history["final_answer"] = "There are 2 critical violations."
+        sample_state_with_history["sql_result"] = "Query:\nSELECT...\n\nResult:\n[(2,)]"
+        from nodes import EXPLORATORY_NOTICE, cache_write
+        result = await cache_write(sample_state_with_history)
+        assert result["data_path"] == "exploratory"
+        assert result["final_answer"].endswith(EXPLORATORY_NOTICE)
+        mock_redis.set.assert_not_called()
+
+    @patch("nodes.redis_client")
+    async def test_cache_hit_restores_data_path(self, mock_redis, sample_state):
+        import json
+        mock_redis.get.return_value = json.dumps({
+            "answer": "There are 48 open violations.",
+            "review_score": 9.0,
+            "data_path": "exploratory",
+        })
+        from nodes import cache_check
+        result = await cache_check(sample_state)
+        assert result["cache_hit"] is True
+        assert result["data_path"] == "exploratory"
 
 
 class TestCacheKeyNormalization:
@@ -617,6 +733,75 @@ class TestCacheContextIsolation:
         assert result["confidence"] == "high"
         assert result["resolved_metric"] == "compliance_effectiveness_score"
         assert json.loads(payload)["metric_version"] == "1.0"
+
+
+class TestCacheMetricVersionCheck:
+    """Cached answers built from a registered metric must be invalidated when
+    the registry no longer carries the same version of that metric."""
+
+    def _payload(self, version="1.0"):
+        import json
+        return json.dumps({
+            "answer": "The score is 55%.",
+            "review_score": 9.0,
+            "resolved_metric": "compliance_effectiveness_score",
+            "metric_version": version,
+        })
+
+    @patch("nodes._get_metric_registry")
+    @patch("nodes.redis_client")
+    async def test_version_mismatch_invalidates(self, mock_redis, mock_registry_fn, sample_state):
+        mock_redis.get.return_value = self._payload(version="1.0")
+        current = MagicMock()
+        current.version = "2.0"
+        mock_registry_fn.return_value.get.return_value = current
+        from nodes import cache_check
+        result = await cache_check(sample_state)
+        assert result["cache_hit"] is False
+        mock_redis.delete.assert_called_once()
+
+    @patch("nodes._get_metric_registry")
+    @patch("nodes.redis_client")
+    async def test_removed_metric_invalidates(self, mock_redis, mock_registry_fn, sample_state):
+        mock_redis.get.return_value = self._payload()
+        mock_registry_fn.return_value.get.return_value = None
+        from nodes import cache_check
+        result = await cache_check(sample_state)
+        assert result["cache_hit"] is False
+        mock_redis.delete.assert_called_once()
+
+    @patch("nodes._get_metric_registry")
+    @patch("nodes.redis_client")
+    async def test_matching_version_serves_hit(self, mock_redis, mock_registry_fn, sample_state):
+        mock_redis.get.return_value = self._payload(version="1.0")
+        current = MagicMock()
+        current.version = "1.0"
+        mock_registry_fn.return_value.get.return_value = current
+        from nodes import cache_check
+        result = await cache_check(sample_state)
+        assert result["cache_hit"] is True
+        assert result["final_answer"] == "The score is 55%."
+        mock_redis.delete.assert_not_called()
+
+    @patch("nodes._get_metric_registry")
+    @patch("nodes.redis_client")
+    async def test_registry_error_invalidates(self, mock_redis, mock_registry_fn, sample_state):
+        """If the registry can't be read, recompute rather than risk staleness."""
+        mock_redis.get.return_value = self._payload()
+        mock_registry_fn.side_effect = RuntimeError("catalog unreadable")
+        from nodes import cache_check
+        result = await cache_check(sample_state)
+        assert result["cache_hit"] is False
+
+    @patch("nodes._get_metric_registry")
+    @patch("nodes.redis_client")
+    async def test_non_metric_answer_skips_registry(self, mock_redis, mock_registry_fn, sample_state):
+        """Answers without a resolved metric are served without consulting the registry."""
+        mock_redis.get.return_value = '{"answer": "Plain cached answer", "review_score": 9.0}'
+        from nodes import cache_check
+        result = await cache_check(sample_state)
+        assert result["cache_hit"] is True
+        mock_registry_fn.assert_not_called()
 
 
 class TestContextResolver:

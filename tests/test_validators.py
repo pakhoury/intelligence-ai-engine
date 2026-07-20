@@ -7,12 +7,14 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "aria"))
 
 from validators import (
+    extract_sql_tables,
     run_all_validators,
     validate_answer_grounding,
     validate_metric_citation,
     validate_number_grounding,
     validate_result_sanity,
     validate_sql_safety,
+    validate_sql_scope,
 )
 
 
@@ -84,6 +86,110 @@ class TestSqlSafety:
         assert result.passed
 
 
+ALLOWED_TABLES = {
+    "COMPLIANCE_VIOLATIONS", "AUDIT_FINDINGS", "RISK_EVENTS",
+    "CONTROL_MAPPINGS", "DUAL",
+}
+
+
+class TestExtractSqlTables:
+    def test_simple_from(self):
+        assert extract_sql_tables("SELECT * FROM COMPLIANCE_VIOLATIONS") == {"COMPLIANCE_VIOLATIONS"}
+
+    def test_alias_not_treated_as_table(self):
+        tables = extract_sql_tables("SELECT cv.STATUS FROM COMPLIANCE_VIOLATIONS cv WHERE cv.STATUS = 'Open'")
+        assert tables == {"COMPLIANCE_VIOLATIONS"}
+
+    def test_joins_extracted(self):
+        sql = (
+            "SELECT * FROM COMPLIANCE_VIOLATIONS v "
+            "LEFT JOIN AUDIT_FINDINGS a ON v.DEPARTMENT = a.DEPARTMENT"
+        )
+        assert extract_sql_tables(sql) == {"COMPLIANCE_VIOLATIONS", "AUDIT_FINDINGS"}
+
+    def test_comma_join_extracted(self):
+        sql = "SELECT * FROM COMPLIANCE_VIOLATIONS v, AUDIT_FINDINGS a WHERE v.DEPARTMENT = a.DEPARTMENT"
+        assert extract_sql_tables(sql) == {"COMPLIANCE_VIOLATIONS", "AUDIT_FINDINGS"}
+
+    def test_derived_table_inner_tables_extracted(self):
+        sql = "SELECT * FROM (SELECT DEPARTMENT FROM RISK_EVENTS) r"
+        assert extract_sql_tables(sql) == {"RISK_EVENTS"}
+
+    def test_string_literals_ignored(self):
+        sql = "SELECT * FROM COMPLIANCE_VIOLATIONS WHERE NOTE = 'copied FROM SECRET_TABLE'"
+        assert extract_sql_tables(sql) == {"COMPLIANCE_VIOLATIONS"}
+
+
+class TestSqlScope:
+    def test_in_scope_passes(self):
+        result = validate_sql_scope(
+            "SELECT COUNT(*) FROM COMPLIANCE_VIOLATIONS", ALLOWED_TABLES,
+        )
+        assert result.passed
+
+    def test_out_of_scope_table_fails(self):
+        result = validate_sql_scope("SELECT * FROM EMPLOYEE_SALARIES", ALLOWED_TABLES)
+        assert not result.passed
+        assert result.score_cap == 0.0
+        assert result.unfixable_cap == 0.0
+        assert "EMPLOYEE_SALARIES" in result.failures[0]
+
+    def test_out_of_scope_join_fails(self):
+        sql = (
+            "SELECT * FROM COMPLIANCE_VIOLATIONS v "
+            "JOIN HR_RECORDS h ON v.DEPARTMENT = h.DEPARTMENT"
+        )
+        result = validate_sql_scope(sql, ALLOWED_TABLES)
+        assert not result.passed
+        assert "HR_RECORDS" in result.failures[0]
+
+    def test_out_of_scope_subquery_fails(self):
+        sql = "SELECT * FROM (SELECT * FROM PAYROLL) p"
+        result = validate_sql_scope(sql, ALLOWED_TABLES)
+        assert not result.passed
+        assert "PAYROLL" in result.failures[0]
+
+    def test_no_allowlist_skips_check(self):
+        result = validate_sql_scope("SELECT * FROM ANYTHING", None)
+        assert result.passed
+        result = validate_sql_scope("SELECT * FROM ANYTHING", set())
+        assert result.passed
+
+    def test_no_sql_possible_skips_check(self):
+        result = validate_sql_scope("NO_SQL_POSSIBLE", ALLOWED_TABLES)
+        assert result.passed
+
+    def test_case_insensitive(self):
+        result = validate_sql_scope(
+            "select * from compliance_violations", ALLOWED_TABLES,
+        )
+        assert result.passed
+
+    def test_run_all_validators_blocks_out_of_scope(self):
+        passed, failures, cap, unfixable_cap = run_all_validators(
+            sql="SELECT * FROM HR_RECORDS",
+            sql_result="Query:\nSELECT * FROM HR_RECORDS\n\nResult:\n[(1,)]",
+            answer="There is 1 record.",
+            retrieved_docs=[],
+            route="sql_only",
+            allowed_tables=ALLOWED_TABLES,
+        )
+        assert not passed
+        assert cap == 0.0
+        assert unfixable_cap == 0.0
+        assert any("out-of-scope" in f for f in failures)
+
+    def test_run_all_validators_skips_without_allowlist(self):
+        passed, failures, cap, unfixable_cap = run_all_validators(
+            sql="SELECT * FROM HR_RECORDS",
+            sql_result="Query:\nSELECT * FROM HR_RECORDS\n\nResult:\n[(1,)]",
+            answer="There is 1 record.",
+            retrieved_docs=[],
+            route="sql_only",
+        )
+        assert not any("out-of-scope" in f for f in failures)
+
+
 class TestResultSanity:
     def test_normal_result(self):
         result = validate_result_sanity("[('Critical', 5), ('High', 12)]")
@@ -153,16 +259,6 @@ class TestAnswerGrounding:
         assert not result.passed
         assert result.score_cap <= 3.0
 
-    def test_numeric_claims_without_sql(self):
-        result = validate_answer_grounding(
-            answer="The score is 85% based on 100 violations.",
-            sql_result="",
-            retrieved_docs=["[Policy]: Some policy text"],
-            route="parallel",
-        )
-        assert not result.passed
-        assert any("numeric claims" in f.lower() for f in result.failures)
-
     def test_docs_only_with_docs(self):
         result = validate_answer_grounding(
             answer="The policy requires enhanced due diligence.",
@@ -189,6 +285,15 @@ class TestNumberGrounding:
         assert not result.passed
         assert result.score_cap == 5.0
 
+    def test_single_ungrounded_number_fails(self):
+        """Zero tolerance: one hallucinated figure is one too many."""
+        result = validate_number_grounding(
+            answer="The score improved by 15 points to reach 85.",
+            sql_result="[('score', 85)]",
+        )
+        assert not result.passed
+        assert any("15" in f for f in result.failures)
+
     def test_trivial_numbers_ignored(self):
         result = validate_number_grounding(
             answer="The score is 0 out of 100 based on 1 violation.",
@@ -196,12 +301,21 @@ class TestNumberGrounding:
         )
         assert result.passed
 
-    def test_no_sql_result_skips(self):
+    def test_no_data_at_all_fails(self):
+        """A numeric claim with no SQL result and no docs is ungrounded by definition."""
         result = validate_number_grounding(
             answer="The score is 42.",
             sql_result="N/A - no SQL data retrieved",
         )
-        assert result.passed
+        assert not result.passed
+
+    def test_error_result_does_not_ground(self):
+        """An error string is not data; numbers 'quoted' from it are hallucinated."""
+        result = validate_number_grounding(
+            answer="The score is 42.",
+            sql_result="Error: something went wrong",
+        )
+        assert not result.passed
 
     def test_no_numbers_in_answer(self):
         result = validate_number_grounding(
@@ -210,19 +324,59 @@ class TestNumberGrounding:
         )
         assert result.passed
 
-    def test_few_ungrounded_passes(self):
+    def test_docs_ground_numbers(self):
+        """docs_only answers are no longer exempt: numbers must appear in the chunks."""
         result = validate_number_grounding(
-            answer="The score improved by 15 points to reach 85.",
-            sql_result="[('score', 85)]",
+            answer="Access violations must be remediated within 48 hours.",
+            sql_result="",
+            retrieved_docs=["[Access Policy]: remediation required within 48 hours"],
         )
         assert result.passed
 
-    def test_error_result_skips(self):
+    def test_docs_do_not_ground_missing_numbers(self):
         result = validate_number_grounding(
-            answer="The score is 42.",
-            sql_result="Error: something went wrong",
+            answer="The transaction limit is $25,000.",
+            sql_result="",
+            retrieved_docs=["[AML Policy]: transactions above the limit require review"],
+        )
+        assert not result.passed
+        assert any("25000" in f for f in result.failures)
+
+    def test_years_exempt(self):
+        result = validate_number_grounding(
+            answer="In Q1 2024 there were 12 violations.",
+            sql_result="[(12,)]",
         )
         assert result.passed
+
+    def test_derived_total_grounded(self):
+        result = validate_number_grounding(
+            answer="Critical (5), High (12), Medium (23), Low (8), totaling 48 violations.",
+            sql_result="[('Critical', 5), ('High', 12), ('Medium', 23), ('Low', 8)]",
+        )
+        assert result.passed
+
+    def test_derived_percentage_grounded(self):
+        result = validate_number_grounding(
+            answer="The resolution rate is 76% — 38 of 50 findings resolved.",
+            sql_result="[(50, 38)]",
+        )
+        assert result.passed
+
+    def test_scaled_units_grounded(self):
+        result = validate_number_grounding(
+            answer="Operational losses reached $500K against credit losses of $2M.",
+            sql_result="[('Operational', 500000), ('Credit', 2000000)]",
+        )
+        assert result.passed
+
+    def test_ratio_does_not_ground_large_counts(self):
+        """Pairwise ratios only ground percent-like values, not arbitrary counts."""
+        result = validate_number_grounding(
+            answer="There were 150 violations.",
+            sql_result="[(3, 2)]",  # 3/2*100 = 150, but 150 is a count, not a rate
+        )
+        assert not result.passed
 
 
 class TestMetricCitation:
@@ -270,7 +424,7 @@ class TestMetricCitation:
 
 class TestRunAllValidators:
     def test_all_pass(self):
-        passed, failures, cap = run_all_validators(
+        passed, failures, cap, unfixable_cap = run_all_validators(
             sql="SELECT COUNT(*) FROM VIOLATIONS",
             sql_result="[(42,)]",
             answer="There are 42 violations.",
@@ -280,9 +434,10 @@ class TestRunAllValidators:
         assert passed
         assert failures == []
         assert cap == 10.0
+        assert unfixable_cap == 10.0
 
     def test_multiple_failures(self):
-        passed, failures, cap = run_all_validators(
+        passed, failures, cap, unfixable_cap = run_all_validators(
             sql="DROP TABLE VIOLATIONS",
             sql_result="Error: blocked",
             answer="",
@@ -292,10 +447,11 @@ class TestRunAllValidators:
         assert not passed
         assert len(failures) >= 2
         assert cap == 0.0
+        assert unfixable_cap == 0.0
 
     def test_new_validators_integrated(self):
         """New validators (number grounding + metric citation) run in the aggregate."""
-        passed, failures, cap = run_all_validators(
+        passed, failures, cap, unfixable_cap = run_all_validators(
             sql="SELECT 1 FROM T",
             sql_result="[('x', 42)]",
             answer="The result is 999.",
@@ -306,3 +462,41 @@ class TestRunAllValidators:
         )
         assert not passed
         assert any("test_metric" in f for f in failures)
+
+    def test_sql_execution_error_is_unfixable(self):
+        """A SQL execution error caps the score in a way reflection cannot lift."""
+        passed, failures, cap, unfixable_cap = run_all_validators(
+            sql="",
+            sql_result="Execution Error: ORA-00942: table or view does not exist",
+            answer="I could not retrieve the data.",
+            retrieved_docs=["[Policy]: some doc"],
+            route="docs_then_sql",
+        )
+        assert not passed
+        assert unfixable_cap == 3.0
+
+    def test_answer_only_failures_stay_fixable(self):
+        """Failures in the answer text (metric citation) don't mark the run unfixable."""
+        passed, failures, cap, unfixable_cap = run_all_validators(
+            sql="SELECT 1 FROM T",
+            sql_result="Query:\nSELECT 1 FROM T\n\nResult:\n[(42,)]",
+            answer="The result is 42.",
+            retrieved_docs=[],
+            route="sql_only",
+            resolved_metric="some_other_metric",
+            compiled_metric=True,
+        )
+        assert not passed
+        assert cap == 6.0
+        assert unfixable_cap == 10.0
+
+    def test_empty_result_set_is_unfixable(self):
+        passed, failures, cap, unfixable_cap = run_all_validators(
+            sql="SELECT 1 FROM T",
+            sql_result="Query:\nSELECT 1 FROM T\n\nResult:\n[]",
+            answer="No records were found.",
+            retrieved_docs=[],
+            route="sql_only",
+        )
+        assert not passed
+        assert unfixable_cap == 6.0

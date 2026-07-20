@@ -86,8 +86,12 @@ class TestWorkflowSQLRoute:
             },
             config={"configurable": {"thread_id": "test-sql-route"}},
         )
+        from nodes import EXPLORATORY_NOTICE
         assert result["route"] == "sql_only"
-        assert result["final_answer"] == "There are 2 critical violations."
+        # LLM-generated SQL (not a compiled metric) → answer must carry the
+        # exploratory-path disclosure.
+        assert result["final_answer"] == "There are 2 critical violations." + EXPLORATORY_NOTICE
+        assert result["data_path"] == "exploratory"
         assert result["review_score"] == 9.0
         mock_deps["vector_store"].similarity_search.assert_not_called()
 
@@ -142,6 +146,9 @@ class TestWorkflowParallelRoute:
 
 class TestWorkflowDocsThenSqlRoute:
     async def test_docs_then_sql_chains_through_extract(self, mock_deps):
+        # Data must support the mocked answer's "$2.4M" or the number
+        # grounding validator triggers reflection.
+        mock_deps["db"].execute_query.return_value = "[(2400000,)]"
         mock_deps["ainvoke"].side_effect = [
             "DOCS_THEN_SQL",                                          # router
             "NO_CLARIFICATION_NEEDED",                                # clarify
@@ -172,6 +179,9 @@ class TestWorkflowDocsThenSqlRoute:
 
 class TestWorkflowSqlThenDocsRoute:
     async def test_sql_then_docs_chains_through_extract(self, mock_deps):
+        # Data must support the mocked answer's "47 incidents" or the number
+        # grounding validator triggers reflection.
+        mock_deps["db"].execute_query.return_value = "[('ACCESS_CONTROL', 47)]"
         mock_deps["ainvoke"].side_effect = [
             "SQL_THEN_DOCS",                                         # router
             "NO_CLARIFICATION_NEEDED",                               # clarify
@@ -291,3 +301,36 @@ class TestWorkflowReflection:
         assert result["review_score"] == 9.0
         assert result["reflection_attempt"] == 2
         mock_deps["redis"].set.assert_called_once()
+
+    async def test_sql_failure_skips_reflection(self, mock_deps):
+        """An unfixable data failure (SQL execution error) must end the run after
+        one review instead of burning reflection cycles that can never pass."""
+        mock_deps["db"].execute_query.return_value = (
+            "Execution Error: ORA-00942: table or view does not exist"
+        )
+        mock_deps["ainvoke"].side_effect = [
+            "SQL_ONLY",                                     # router
+            "NO_CLARIFICATION_NEEDED",                      # clarify
+            "COMPLIANCE_VIOLATIONS",                        # table selection
+            "SELECT COUNT(*) FROM VIOLATIONS",              # sql attempt 1
+            "SELECT COUNT(*) FROM VIOLATIONS",              # sql attempt 2
+            "SELECT COUNT(*) FROM VIOLATIONS",              # sql attempt 3
+            "I was unable to retrieve the requested data.",  # answer
+            "Score: 9.0\nDecision: APPROVED",               # reviewer
+        ]
+        from workflow import app as workflow_app
+
+        result = await workflow_app.ainvoke(
+            {
+                "question": "How many violations?",
+                "session_id": "s1",
+                "conversation_history": [],
+            },
+            config={"configurable": {"thread_id": "test-skip-reflection"}},
+        )
+        assert result["skip_reflection"] is True
+        assert result["reflection_attempt"] == 1
+        assert result["review_score"] <= 3.0
+        # No reflection cycles ran: exactly the 8 mocked calls were consumed.
+        assert mock_deps["ainvoke"].call_count == 8
+        mock_deps["redis"].set.assert_not_called()

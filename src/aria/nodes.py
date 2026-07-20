@@ -18,7 +18,7 @@ from metrics.registry import MetricDefinition
 from observability import CACHE_OPS, REFLECTION_COUNT, REVIEW_SCORE, ROUTE_COUNT, NodeTimer, logger
 from retrieval import lexical_search, rrf_fuse
 from security import dlp_scan, redact_pii, sanitize_for_prompt
-from validators import run_all_validators, validate_sql_safety
+from validators import run_all_validators, validate_sql_safety, validate_sql_scope
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 COLLECTION_NAME = "compliance_docs"
@@ -27,6 +27,10 @@ COLLECTION_NAME = "compliance_docs"
 # final number of chunks passed downstream after RRF.
 RETRIEVAL_CANDIDATES = 20
 RETRIEVAL_TOP_N = 6
+
+# Review score at or above which an answer passes without reflection and is
+# eligible for caching. Shared with the workflow's after_review edge.
+REVIEW_PASS_THRESHOLD = 7.0
 
 _metric_resolver: LLMMetricResolver | None = None
 _metric_registry = None
@@ -130,6 +134,31 @@ def _cache_key(question: str) -> str:
     return f"rag:answer:{hashlib.sha256(normalized.encode()).hexdigest()[:16]}"
 
 
+def _cached_metric_is_stale(payload: dict) -> bool:
+    """Check whether a cached answer was built from an outdated metric definition.
+
+    A cached answer derived from a registered metric is only servable while
+    the registry still carries the same version of that metric. On any doubt
+    (metric gone, version changed, registry unreadable) treat the entry as
+    stale — recomputing costs a few LLM calls; serving an outdated compliance
+    figure is worse.
+    """
+    metric_id = payload.get("resolved_metric")
+    if not metric_id:
+        return False
+    try:
+        current = _get_metric_registry().get(metric_id)
+    except Exception as e:
+        logger.warning(
+            f"Metric registry unavailable for cache validation: {e}",
+            extra={"node": "cache_check", "error": str(e)},
+        )
+        return True
+    if current is None:
+        return True
+    return current.version != payload.get("metric_version")
+
+
 def _parse_review_score(content: str) -> float | None:
     """Parse review score from LLM output. Returns None if no score found.
 
@@ -180,21 +209,41 @@ async def cache_check(state: dict):
         try:
             cached = await asyncio.to_thread(redis_client.get, key)
             if cached:
-                logger.info("Cache HIT", extra={"node": "cache_check", "cache_hit": True})
-                CACHE_OPS.labels(result="hit").inc()
                 try:
                     payload = json.loads(cached)
                     if not isinstance(payload, dict) or "answer" not in payload:
                         payload = {"answer": cached}
                 except ValueError:
                     payload = {"answer": cached}  # legacy plain-string entry
+
+                if _cached_metric_is_stale(payload):
+                    logger.info(
+                        "Cache STALE (metric definition changed), invalidating",
+                        extra={
+                            "node": "cache_check",
+                            "metric": payload.get("resolved_metric"),
+                            "cached_version": payload.get("metric_version"),
+                        },
+                    )
+                    CACHE_OPS.labels(result="stale").inc()
+                    try:
+                        await asyncio.to_thread(redis_client.delete, key)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to delete stale cache entry: {e}",
+                            extra={"node": "cache_check", "error": str(e)},
+                        )
+                    return {"cache_hit": False}
+
+                logger.info("Cache HIT", extra={"node": "cache_check", "cache_hit": True})
+                CACHE_OPS.labels(result="hit").inc()
                 result = {
                     "cache_hit": True,
                     "final_answer": payload["answer"],
                     "review_score": payload.get("review_score", 10.0),
                     "confidence": payload.get("confidence", "unknown"),
                 }
-                for field in ("resolved_metric", "metric_version", "route"):
+                for field in ("resolved_metric", "metric_version", "route", "data_path"):
                     if payload.get(field):
                         result[field] = payload[field]
                 return result
@@ -429,6 +478,29 @@ def _strip_sql_fences(sql: str) -> str:
 MAX_SQL_RETRIES = 2
 
 
+_allowed_tables_cache: set[str] | None = None
+
+
+def _allowed_tables() -> set[str]:
+    """Catalog table allowlist for SQL scope validation, cached per process.
+
+    An unreadable catalog returns an empty set (scope check is skipped)
+    rather than blocking every query; the failure is not cached so the
+    allowlist recovers as soon as the catalog does.
+    """
+    global _allowed_tables_cache
+    if _allowed_tables_cache is None:
+        try:
+            _allowed_tables_cache = {t.upper() for t in db_connector.get_allowed_tables()}
+        except Exception as e:
+            logger.warning(
+                f"Table allowlist unavailable, SQL scope check skipped: {e}",
+                extra={"node": "sql_path", "error": str(e)},
+            )
+            return set()
+    return _allowed_tables_cache
+
+
 _compiler = MetricCompiler()
 
 
@@ -560,6 +632,17 @@ async def sql_path(state: dict):
                 if attempt < MAX_SQL_RETRIES:
                     continue
                 return {"sql_result": f"Error: SQL blocked by safety validator — {last_error}"}
+
+            scope = validate_sql_scope(sql, _allowed_tables())
+            if not scope.passed:
+                last_error = "; ".join(scope.failures)
+                logger.warning(
+                    f"SQL scope check failed (attempt {attempt + 1}): {last_error}",
+                    extra={"node": "sql_path", "error": last_error},
+                )
+                if attempt < MAX_SQL_RETRIES:
+                    continue
+                return {"sql_result": f"Error: SQL blocked by scope validator — {last_error}"}
 
             col_error = await asyncio.to_thread(db_connector.validate_columns, sql, tables)
             if col_error:
@@ -766,7 +849,7 @@ async def reviewer_node(state: dict):
         if sql_result and "Query:\n" in sql_result:
             sql_query = sql_result.split("Query:\n", 1)[1].split("\n\nResult:\n", 1)[0]
 
-        _, validator_failures, score_cap = run_all_validators(
+        _, validator_failures, score_cap, unfixable_cap = run_all_validators(
             sql=sql_query,
             sql_result=sql_result,
             answer=state.get("final_answer", ""),
@@ -774,6 +857,7 @@ async def reviewer_node(state: dict):
             route=state.get("route", ""),
             resolved_metric=state.get("resolved_metric", ""),
             compiled_metric=state.get("compiled_metric", False),
+            allowed_tables=_allowed_tables(),
         )
 
         if validator_failures:
@@ -784,10 +868,22 @@ async def reviewer_node(state: dict):
             score = min(score, score_cap)
             content += f"\n\n[Validator]: {'; '.join(validator_failures)}"
 
+        # A validator cap rooted in the data (SQL error, empty result, no
+        # supporting evidence) re-applies on every reflection cycle, so if it
+        # already pins the score below the pass threshold, regenerating the
+        # answer can never succeed — skip the loop instead of burning cycles.
+        skip_reflection = unfixable_cap < REVIEW_PASS_THRESHOLD
+        if skip_reflection:
+            logger.info(
+                f"Skipping reflection: unfixable data failure caps score at {unfixable_cap}",
+                extra={"node": "reviewer", "unfixable_cap": unfixable_cap},
+            )
+
         result = {
             "review_score": score,
             "reflection_attempt": state.get("reflection_attempt", 0) + 1,
             "reviewer_feedback": content.strip(),
+            "skip_reflection": skip_reflection,
         }
 
         answer = state.get("final_answer", "")
@@ -807,22 +903,58 @@ async def reviewer_node(state: dict):
         return result
 
 
+EXPLORATORY_NOTICE = (
+    "\n\n---\n"
+    "⚠️ Exploratory result: the figures above were produced by AI-generated SQL, "
+    "not a governed metric definition. Verify independently before regulatory or audit use."
+)
+
+
+def _data_path(state: dict) -> str:
+    """Classify the provenance of the answer's data, for labeling and audit.
+
+    "governed"    — numbers came from a compiled, versioned metric definition
+    "exploratory" — numbers came from LLM-generated SQL (lower trust)
+    "documents"   — answer is grounded in retrieved documents only
+    "none"        — no supporting data was retrieved
+    """
+    if state.get("compiled_metric"):
+        return "governed"
+    sql_result = state.get("sql_result", "")
+    if sql_result and not sql_result.startswith(("Error", "Execution Error", "N/A")):
+        return "exploratory"
+    if state.get("retrieved_docs"):
+        return "documents"
+    return "none"
+
+
 async def cache_write(state: dict):
     with NodeTimer("cache_write"):
+        data_path = _data_path(state)
+        updates: dict = {"data_path": data_path}
+
+        answer = state.get("final_answer", "")
+        if answer and data_path == "exploratory":
+            # Numbers reached the user via the ungoverned LLM-SQL path —
+            # the answer itself must say so, not just response metadata.
+            answer = answer + EXPLORATORY_NOTICE
+            updates["final_answer"] = answer
+
         if state.get("conversation_history"):
             # Mirror of cache_check: context-dependent answers are never cached.
-            return {}
-        if state.get("review_score", 0) >= 7.0 and state.get("final_answer"):
+            return updates
+        if state.get("review_score", 0) >= REVIEW_PASS_THRESHOLD and answer:
             # Key on the ORIGINAL question text — the same key cache_check
             # computes on the next identical request.
             key = _cache_key(state.get("original_question") or state["question"])
             payload = json.dumps({
-                "answer": state["final_answer"],
+                "answer": answer,
                 "review_score": state.get("review_score"),
                 "confidence": state.get("confidence", "unknown"),
                 "resolved_metric": state.get("resolved_metric"),
                 "metric_version": state.get("metric_version"),
                 "route": state.get("route"),
+                "data_path": data_path,
             })
             try:
                 await asyncio.to_thread(
@@ -831,4 +963,4 @@ async def cache_write(state: dict):
                 logger.info("Cached answer", extra={"node": "cache_write", "cache_key": key})
             except Exception as e:
                 logger.warning(f"Cache write failed: {e}", extra={"node": "cache_write", "error": str(e)})
-        return {}
+        return updates

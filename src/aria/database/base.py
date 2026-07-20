@@ -73,6 +73,13 @@ class DatabaseConnector(ABC):
 
     # ── Catalog-based methods (shared across all dialects) ───────────
 
+    def get_allowed_tables(self) -> set[str]:
+        """All table names in the governed catalog — the SQL scope allowlist."""
+        tables: set[str] = set()
+        for schema_data in self.catalog.get("schemas", {}).values():
+            tables.update(schema_data.get("tables", {}).keys())
+        return {t.upper() for t in tables}
+
     def get_relevant_tables(self, question: str) -> list[str]:
         """Keyword-based table selection — the non-LLM fallback path.
 

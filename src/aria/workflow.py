@@ -5,6 +5,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 from nodes import (
+    REVIEW_PASS_THRESHOLD,
     answer_generator,
     cache_check,
     cache_write,
@@ -34,6 +35,7 @@ class AgentState(TypedDict, total=False):
     retrieved_docs: list
     reflection_attempt: int
     reviewer_feedback: str
+    skip_reflection: bool
     extracted_context: str
     resolved_metric: str
     metric_version: str
@@ -41,6 +43,7 @@ class AgentState(TypedDict, total=False):
     metric_params: dict
     compiled_metric: bool
     confidence: str
+    data_path: str  # "governed" | "exploratory" | "documents" | "none"
 
 MAX_REFLECTION_ATTEMPTS = 2
 
@@ -152,9 +155,13 @@ workflow.add_edge("answer_generator", "reviewer")
 
 
 def after_review(s):
+    if s.get("skip_reflection"):
+        # The low score comes from an upstream data failure (SQL error, empty
+        # result) that regenerating the answer cannot fix.
+        return "cache_write"
     score = s.get("review_score", 0)
     attempts = s.get("reflection_attempt", 0)
-    if score >= 7.0 or attempts >= MAX_REFLECTION_ATTEMPTS:
+    if score >= REVIEW_PASS_THRESHOLD or attempts >= MAX_REFLECTION_ATTEMPTS:
         return "cache_write"
     return "answer_generator"
 

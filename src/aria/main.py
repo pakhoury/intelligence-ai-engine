@@ -180,6 +180,7 @@ async def query(
                     "metric_version": result.get("metric_version"),
                     "compiled": result.get("compiled_metric", False),
                     "confidence": result.get("confidence", "unknown"),
+                    "data_path": result.get("data_path", "none"),
                     "review_score": result.get("review_score"),
                 },
             }
