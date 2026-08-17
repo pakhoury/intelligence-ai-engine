@@ -246,9 +246,7 @@ def _is_grounded(value: float, source_numbers: set, ratios: set) -> bool:
     for factor in _SCALE_FACTORS:
         if value * factor in source_numbers:
             return True
-    if 0 < value <= 100 and value in ratios:
-        return True
-    return False
+    return 0 < value <= 100 and value in ratios
 
 
 def validate_number_grounding(

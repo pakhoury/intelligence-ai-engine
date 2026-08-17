@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install ruff
+      - run: pip install ruff==0.15.21
       - run: ruff check src/aria/ tests/
 
   test:
@@ -47,13 +47,23 @@ jobs:
         run: docker build -t aria:test .
       - name: Verify image starts
         run: |
+          # config.py constructs ChatGroq at import time, so the app cannot boot
+          # without a GROQ_API_KEY — any non-empty value works here because this
+          # is a startup smoke test that never calls the LLM.
+          # ENVIRONMENT=development is explicit (it is also the code default):
+          # with no PostgreSQL reachable, the checkpointer must fall back to
+          # MemorySaver instead of raising the production RuntimeError.
           docker run -d --name test-app -p 8000:8000 \
+            -e GROQ_API_KEY=dummy-key-for-startup-smoke-test \
+            -e ENVIRONMENT=development \
             -e REDIS_HOST=localhost \
             -e POSTGRES_HOST=localhost \
             -e ORACLE_HOST=localhost \
             aria:test
+          # Startup waits out a ~30s psycopg pool timeout before the checkpointer
+          # falls back, so the probe budget has to comfortably exceed that.
           healthy=""
-          for i in $(seq 1 30); do
+          for i in $(seq 1 40); do
             if curl -fsS http://localhost:8000/health; then
               healthy=1
               break
@@ -62,7 +72,7 @@ jobs:
           done
           docker logs test-app
           if [ -z "$healthy" ]; then
-            echo "::error::App did not become healthy within 90s"
+            echo "::error::App did not become healthy within 120s"
             exit 1
           fi
           docker stop test-app

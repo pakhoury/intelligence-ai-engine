@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
+import workflow
 from authz import AuthzDecision, Principal, get_authz_client
 from config import redis_client
 from observability import (
@@ -25,7 +26,6 @@ from observability import (
     trace_id_var,
     tracer,
 )
-import workflow
 from security import API_KEY_HEADER, limiter, validate_question
 
 _checkpointer_pool = None
