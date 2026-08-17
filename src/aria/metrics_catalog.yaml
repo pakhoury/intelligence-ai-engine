@@ -9,6 +9,9 @@ metrics:
       all violations recorded within a given time period.
     category: "compliance"
     unit: "%"
+    owner: "compliance-analytics"
+    approval: "MRM-2026-0117"
+    rounding: "percentage_2dp"
     formula: "(number of closed violations / total number of violations) * 100"
     keywords:
       - "compliance effectiveness"
@@ -91,6 +94,8 @@ metrics:
       to understand the risk profile of outstanding and historical violations.
     category: "compliance"
     unit: "count"
+    owner: "compliance-analytics"
+    approval: "MRM-2026-0118"
     formula: "Count of violations grouped by SEVERITY level, optionally also broken down by STATUS"
     keywords:
       - "violation severity"
@@ -170,6 +175,9 @@ metrics:
       audit observations.
     category: "audit"
     unit: "%"
+    owner: "internal-audit"
+    approval: "MRM-2026-0121"
+    rounding: "percentage_2dp"
     formula: "(number of resolved audit findings / total audit findings) * 100"
     keywords:
       - "audit finding resolution"
@@ -259,6 +267,9 @@ metrics:
       risk if open violations result in penalties.
     category: "risk"
     unit: "USD"
+    owner: "risk-analytics"
+    approval: "MRM-2026-0125"
+    rounding: "currency_standard"
     formula: "Sum of FINANCIAL_IMPACT for all violations where STATUS is not Closed, grouped by REGULATORY_BODY"
     keywords:
       - "regulatory exposure"
@@ -351,6 +362,8 @@ metrics:
       risk events. Higher score indicates higher risk.
     category: "risk"
     unit: "score"
+    owner: "risk-analytics"
+    approval: "MRM-2026-0126"
     formula: "(critical_violations * 10 + high_violations * 5 + medium_violations * 2 + low_violations * 1) + (open_audit_findings * 3) + (risk_events * 4)"
     keywords:
       - "department risk"
@@ -452,6 +465,9 @@ metrics:
       lacks controls to enforce compliance.
     category: "governance"
     unit: "%"
+    owner: "controls-governance"
+    approval: "MRM-2026-0129"
+    rounding: "percentage_2dp"
     formula: "(count of distinct compliance requirements with active controls / total distinct compliance requirements) * 100"
     keywords:
       - "control coverage"
@@ -523,6 +539,9 @@ metrics:
       the speed of the compliance remediation process.
     category: "operations"
     unit: "days"
+    owner: "compliance-operations"
+    approval: "MRM-2026-0132"
+    rounding: "days_1dp"
     formula: "Average of (CLOSURE_DATE - VIOLATION_DATE) for all closed violations"
     keywords:
       - "mean time to resolution"

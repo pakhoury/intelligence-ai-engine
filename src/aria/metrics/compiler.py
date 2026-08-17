@@ -18,12 +18,19 @@ from .registry import MetricDefinition, MetricSQL
 
 @dataclass(frozen=True)
 class CompiledSQL:
-    """Output of the metric compiler — deterministic SQL ready for execution."""
+    """Output of the metric compiler — deterministic SQL ready for execution.
+
+    Carries the spec's governance metadata so the audit trail records not
+    just what ran, but who owns the calculation and which review approved it.
+    """
     metric_id: str
     version: str
     sql: str
     parameters_used: dict[str, str]
     compilation_mode: str
+    owner: str = ""
+    approval: str = ""
+    rounding: str = ""
 
 
 _DANGEROUS_SQL_RE = re.compile(r"(--|/\*|\*/|;)")
@@ -151,4 +158,7 @@ class MetricCompiler:
             sql=sql,
             parameters_used=effective_params,
             compilation_mode=mode,
+            owner=metric.owner,
+            approval=metric.approval,
+            rounding=metric.rounding,
         )

@@ -8,6 +8,8 @@ These catch issues that don't require LLM judgment:
 """
 import re
 
+from observability import VALIDATOR_FAILURES
+
 
 class ValidationResult:
     __slots__ = ("passed", "failures", "score_cap", "unfixable_cap")
@@ -357,22 +359,29 @@ def run_all_validators(
     retrieved data rather than the answer text. It re-applies on every
     reflection cycle, so if it is below the review pass threshold the
     reflection loop can never succeed and should be skipped.
+
+    Each validator that fails increments rag_validator_failures_total,
+    labeled by validator name, so failure rates are visible on dashboards
+    rather than only in text logs.
     """
-    results = [
-        validate_sql_safety(sql),
-        validate_sql_scope(sql, allowed_tables),
-        validate_result_sanity(sql_result),
-        validate_answer_grounding(answer, sql_result, retrieved_docs, route),
-        validate_number_grounding(answer, sql_result, retrieved_docs),
-        validate_metric_citation(answer, resolved_metric, compiled_metric),
+    named_results = [
+        ("sql_safety", validate_sql_safety(sql)),
+        ("sql_scope", validate_sql_scope(sql, allowed_tables)),
+        ("result_sanity", validate_result_sanity(sql_result)),
+        ("answer_grounding", validate_answer_grounding(answer, sql_result, retrieved_docs, route)),
+        ("number_grounding", validate_number_grounding(answer, sql_result, retrieved_docs)),
+        ("metric_citation", validate_metric_citation(answer, resolved_metric, compiled_metric)),
     ]
 
-    all_passed = all(r.passed for r in results)
+    all_passed = True
     failures = []
     score_cap = 10.0
     unfixable_cap = 10.0
 
-    for r in results:
+    for name, r in named_results:
+        if not r.passed:
+            all_passed = False
+            VALIDATOR_FAILURES.labels(validator=name).inc()
         failures.extend(r.failures)
         score_cap = min(score_cap, r.score_cap)
         unfixable_cap = min(unfixable_cap, r.unfixable_cap)

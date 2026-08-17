@@ -258,6 +258,64 @@ class TestEvalGoldenDataset:
         )
 
 
+class TestEvalConsistency:
+    """Reproducibility regression check: the same question, replayed against
+    identical mocked LLM/DB/vector responses, must produce an identical
+    result. Every external dependency is held fixed here, so any divergence
+    between the two runs means the *application code itself* has a
+    non-deterministic path (e.g. an unsorted set iteration order, a
+    dict built from unordered input) — not an LLM sampling artifact.
+
+    This matters specifically for this system: the entire pitch of the
+    governed metric path is that "same input = same output" is auditable.
+    A hidden non-deterministic branch anywhere in the pipeline undermines
+    that even if the LLM itself is temperature=0.
+    """
+
+    _CASES = [c for c in GOLDEN_CASES if not c.get("needs_clarification") and not c.get("expected_sql_blocked")]
+
+    @pytest.mark.parametrize(
+        "workflow_mocks", _CASES, indirect=True, ids=[c["id"] for c in _CASES],
+    )
+    async def test_golden_case_is_reproducible(self, workflow_mocks):
+        case = workflow_mocks["case"]
+        mock_ainvoke = workflow_mocks["ainvoke"]
+        from workflow import app as workflow_app
+
+        first = await workflow_app.ainvoke(
+            {
+                "question": case["question"],
+                "session_id": f"eval-consistency-{case['id']}",
+                "conversation_history": [],
+            },
+            config={"configurable": {"thread_id": f"eval-consistency-{case['id']}-run1"}},
+        )
+
+        # Same case, same canned responses, replayed fresh — the first
+        # invocation consumed the mock's side_effect list.
+        mock_ainvoke.side_effect = _build_llm_side_effects(case)
+
+        second = await workflow_app.ainvoke(
+            {
+                "question": case["question"],
+                "session_id": f"eval-consistency-{case['id']}",
+                "conversation_history": [],
+            },
+            config={"configurable": {"thread_id": f"eval-consistency-{case['id']}-run2"}},
+        )
+
+        compared_fields = (
+            "route", "final_answer", "review_score", "confidence",
+            "data_path", "resolved_metric", "sql_result",
+        )
+        for field in compared_fields:
+            assert first.get(field) == second.get(field), (
+                f"Case {case['id']}: '{field}' differs between two runs of identical "
+                f"input — {first.get(field)!r} vs {second.get(field)!r}. Likely a "
+                f"non-deterministic code path (e.g. unsorted set/dict iteration)."
+            )
+
+
 class TestEvalSqlSafety:
     """Verify SQL injection attempts are blocked by deterministic validators."""
 

@@ -12,13 +12,20 @@ import threading
 import time
 from enum import Enum
 
-from observability import logger
+from observability import CIRCUIT_BREAKER_STATE, CIRCUIT_BREAKER_TRIPS, logger
 
 
 class CircuitState(Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
+
+
+_GAUGE_VALUE = {
+    CircuitState.CLOSED: 0,
+    CircuitState.OPEN: 1,
+    CircuitState.HALF_OPEN: 2,
+}
 
 
 class CircuitBreakerOpenError(Exception):
@@ -68,12 +75,18 @@ class CircuitBreaker:
         self._success_count = 0
         self._last_failure_time: float | None = None
         self._lock = threading.Lock()
+        CIRCUIT_BREAKER_STATE.labels(name=self.name).set(_GAUGE_VALUE[self._state])
+
+    def _set_state(self, new_state: CircuitState) -> None:
+        """Assign state and mirror it to the Prometheus gauge. Caller holds the lock."""
+        self._state = new_state
+        CIRCUIT_BREAKER_STATE.labels(name=self.name).set(_GAUGE_VALUE[new_state])
 
     @property
     def state(self) -> CircuitState:
         with self._lock:
             if self._state == CircuitState.OPEN and self._should_attempt_recovery():
-                self._state = CircuitState.HALF_OPEN
+                self._set_state(CircuitState.HALF_OPEN)
                 logger.info(
                     f"Circuit breaker '{self.name}' entering HALF_OPEN",
                     extra={"node": "circuit_breaker"},
@@ -99,7 +112,7 @@ class CircuitBreaker:
             if self._state == CircuitState.HALF_OPEN:
                 self._success_count += 1
                 if self._success_count >= self.success_threshold:
-                    self._state = CircuitState.CLOSED
+                    self._set_state(CircuitState.CLOSED)
                     self._failure_count = 0
                     self._success_count = 0
                     logger.info(
@@ -117,14 +130,16 @@ class CircuitBreaker:
             self._last_failure_time = time.monotonic()
 
             if self._state == CircuitState.HALF_OPEN:
-                self._state = CircuitState.OPEN
+                self._set_state(CircuitState.OPEN)
                 self._success_count = 0
+                CIRCUIT_BREAKER_TRIPS.labels(name=self.name).inc()
                 logger.warning(
                     f"Circuit breaker '{self.name}' OPEN (half-open test failed)",
                     extra={"node": "circuit_breaker"},
                 )
             elif self._failure_count >= self.failure_threshold:
-                self._state = CircuitState.OPEN
+                self._set_state(CircuitState.OPEN)
+                CIRCUIT_BREAKER_TRIPS.labels(name=self.name).inc()
                 logger.warning(
                     f"Circuit breaker '{self.name}' OPEN "
                     f"(threshold {self.failure_threshold} reached)",
@@ -134,7 +149,7 @@ class CircuitBreaker:
     def reset(self):
         """Manually reset to closed state."""
         with self._lock:
-            self._state = CircuitState.CLOSED
+            self._set_state(CircuitState.CLOSED)
             self._failure_count = 0
             self._success_count = 0
             self._last_failure_time = None

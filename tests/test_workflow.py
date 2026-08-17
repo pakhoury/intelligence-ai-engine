@@ -334,3 +334,71 @@ class TestWorkflowReflection:
         # No reflection cycles ran: exactly the 8 mocked calls were consumed.
         assert mock_deps["ainvoke"].call_count == 8
         mock_deps["redis"].set.assert_not_called()
+
+
+class TestAsyncOnlyCheckpointerCompatibility:
+    """Regression test for a real deployment bug: AsyncPostgresSaver (the
+    persistent-checkpointer backend used in production) implements only the
+    async checkpoint API — its sync methods raise NotImplementedError. Any
+    code path that calls the graph's sync state-history/invoke methods
+    breaks against it, even though the same code works fine against
+    MemorySaver (which implements both). This test compiles the real graph
+    against an async-only checkpointer to catch that class of regression
+    without needing a live Postgres instance."""
+
+    async def test_aget_state_history_works_sync_does_not(self, mock_deps):
+        from langgraph.checkpoint.memory import MemorySaver
+
+        from workflow import workflow
+
+        class AsyncOnlyCheckpointer(MemorySaver):
+            """MemorySaver's own async methods just delegate to its sync
+            methods (`aget_tuple` calls `self.get_tuple`), so naively
+            overriding the sync methods to raise breaks the async path too.
+            Bypass that delegation by calling the base implementation
+            directly (`MemorySaver.get_tuple(self, ...)`), so the async
+            surface stays fully functional while the sync surface — the
+            thing this test needs disabled — is not.
+            """
+
+            async def aget_tuple(self, config):
+                return MemorySaver.get_tuple(self, config)
+
+            async def alist(self, config, **kwargs):
+                for item in MemorySaver.list(self, config, **kwargs):
+                    yield item
+
+            async def aput(self, config, checkpoint, metadata, new_versions):
+                return MemorySaver.put(self, config, checkpoint, metadata, new_versions)
+
+            async def aput_writes(self, config, writes, task_id, task_path=""):
+                return MemorySaver.put_writes(self, config, writes, task_id, task_path)
+
+            def get_tuple(self, config):
+                raise NotImplementedError
+
+            def list(self, config, **kwargs):
+                raise NotImplementedError
+
+            def put(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def put_writes(self, *args, **kwargs):
+                raise NotImplementedError
+
+        compiled = workflow.compile(checkpointer=AsyncOnlyCheckpointer())
+        config = {"configurable": {"thread_id": "async-only-test"}}
+
+        mock_deps["redis"].get.return_value = "Cached answer"
+        await compiled.ainvoke(
+            {"question": "How many violations?", "session_id": "s1", "conversation_history": []},
+            config=config,
+        )
+
+        # The async interface (what main.py's /audit endpoint must use) works.
+        states = [s async for s in compiled.aget_state_history(config)]
+        assert len(states) > 0
+
+        # The sync interface (the original bug) does not.
+        with pytest.raises(NotImplementedError):
+            list(compiled.get_state_history(config))

@@ -8,3 +8,6 @@ __pycache__
 oracle_data
 postgres_data
 redis_data
+.cache
+**/.cache
+src/aria/.cache

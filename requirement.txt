@@ -3,13 +3,13 @@ fastapi>=0.115.0,<1.0
 uvicorn>=0.34.0,<1.0
 
 # LLM Orchestration
-langgraph>=0.3.0,<1.0
-langchain>=0.3.0,<1.0
-langchain-core>=0.3.0,<1.0
-langchain-groq>=0.2.0,<1.0
-langchain-community>=0.3.0,<1.0
-langchain-huggingface>=0.1.0,<1.0
-langchain-text-splitters>=0.3.0,<1.0
+langgraph>=1.1.0,<2.0
+langchain>=1.2.0,<2.0
+langchain-core>=1.2.0,<2.0
+langchain-groq>=1.1.0,<2.0
+langchain-community>=0.4.0,<1.0
+langchain-huggingface>=1.2.0,<2.0
+langchain-text-splitters>=1.1.0,<2.0
 
 # Embeddings
 sentence-transformers>=3.0.0,<4.0
@@ -45,6 +45,7 @@ prometheus-client>=0.21.0,<1.0
 # Security
 slowapi>=0.1.9,<1.0
 python-multipart>=0.0.9,<1.0
+httpx>=0.27.0,<1.0  # async client for the external RBAC/authz service (authz.py)
 
 # Reliability
 tenacity>=8.2.0,<10.0

@@ -47,6 +47,26 @@ def _load_catalog_columns(catalog_path: Path = CATALOG_DIR) -> dict[str, set[str
     return table_columns
 
 
+def validate_governance(metric: MetricDefinition) -> list[str]:
+    """Check the governance metadata that makes a spec an accountable artifact.
+
+    Every metric must name an accountable owner and reference the review
+    that approved it. Returns a list of errors (empty = compliant).
+    """
+    errors: list[str] = []
+    if not metric.owner:
+        errors.append(
+            f"{metric.metric_id}: missing owner — governed metrics must name "
+            f"an accountable team"
+        )
+    if not metric.approval:
+        errors.append(
+            f"{metric.metric_id}: missing approval — governed metrics must "
+            f"reference the review that authorized them"
+        )
+    return errors
+
+
 def validate_metric(
     metric: MetricDefinition,
     catalog_path: Path = CATALOG_DIR,
@@ -55,7 +75,7 @@ def validate_metric(
 
     Returns (is_valid, list_of_errors).
     """
-    errors: list[str] = []
+    errors: list[str] = validate_governance(metric)
 
     if not metric.name:
         errors.append(f"{metric.metric_id}: missing name")

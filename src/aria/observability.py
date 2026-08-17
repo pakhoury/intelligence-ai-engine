@@ -98,6 +98,48 @@ NODE_ERRORS = Counter(
     registry=REGISTRY,
 )
 
+NODE_BUDGET_EXCEEDED = Counter(
+    "rag_node_budget_exceeded_total",
+    "Node executions that exceeded their latency budget",
+    ["node"],
+    registry=REGISTRY,
+)
+
+# Per-node latency SLOs in milliseconds. These are initial engineering
+# estimates (one LLM call ~= 0.8-2s on the primary model, DB/vector round
+# trips are sub-second) — tune from rag_node_duration_seconds production
+# data once real traffic exists. Exceeding a budget is observability only:
+# it never fails or cancels the request (that's REQUEST_TIMEOUT's job) —
+# it just surfaces which stage is burning the budget before the aggregate
+# timeout trips.
+NODE_LATENCY_BUDGETS_MS: dict[str, float] = {
+    "cache_check": 1000,
+    "context_resolver": 10000,
+    "router": 10000,
+    "clarify": 10000,
+    "metric_resolver": 15000,
+    "sql_path": 40000,  # up to 3 LLM calls (table selection + generation + retries) + DB execution
+    "vector_retrieval": 15000,  # vector + lexical search, concurrent, no LLM call
+    "extract": 12000,
+    "answer_generator": 25000,
+    "reviewer": 18000,
+    "cache_write": 1000,
+}
+
+
+def _check_budget(node_name: str, duration_ms: float) -> bool:
+    """Compare a node's measured duration against its latency budget.
+
+    Returns True (and records the breach) if a budget is defined for this
+    node and it was exceeded; False if the node has no budget or stayed
+    within it. Pure function so it's testable without real timing.
+    """
+    budget_ms = NODE_LATENCY_BUDGETS_MS.get(node_name)
+    if budget_ms is None or duration_ms <= budget_ms:
+        return False
+    NODE_BUDGET_EXCEEDED.labels(node=node_name).inc()
+    return True
+
 REVIEW_SCORE = Histogram(
     "rag_review_score",
     "Answer review scores from reviewer node",
@@ -195,7 +237,8 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
         for key in ("duration_ms", "tokens", "model", "route", "score",
-                     "cache_hit", "sql", "error", "llm_call"):
+                     "cache_hit", "sql", "error", "llm_call",
+                     "metric", "version", "owner", "approval", "action"):
             val = getattr(record, key, None)
             if val is not None:
                 log[key] = val
@@ -363,6 +406,7 @@ class NodeTimer:
         duration_ms = duration_s * 1000
 
         NODE_LATENCY.labels(node=self.node_name).observe(duration_s)
+        over_budget = _check_budget(self.node_name, duration_ms)
 
         if exc_type:
             NODE_ERRORS.labels(node=self.node_name).inc()
@@ -379,8 +423,20 @@ class NodeTimer:
                 extra={"node": self.node_name, "duration_ms": round(duration_ms, 1)},
             )
 
+        if over_budget:
+            logger.warning(
+                f"Node '{self.node_name}' exceeded its latency budget "
+                f"({duration_ms:.0f}ms > {NODE_LATENCY_BUDGETS_MS[self.node_name]:.0f}ms)",
+                extra={
+                    "node": self.node_name,
+                    "duration_ms": round(duration_ms, 1),
+                    "error": "latency_budget_exceeded",
+                },
+            )
+
         if self._span:
             self._span.set_attribute("node.duration_ms", round(duration_ms, 1))
+            self._span.set_attribute("node.budget_exceeded", over_budget)
             self._span.end()
 
         return False

@@ -70,6 +70,9 @@ def _parse_metric(metric_id: str, raw: dict) -> MetricDefinition:
         category=raw.get("category", ""),
         unit=raw.get("unit", ""),
         formula=raw.get("formula", ""),
+        owner=raw.get("owner", ""),
+        approval=raw.get("approval", ""),
+        rounding=raw.get("rounding", ""),
         keywords=tuple(raw.get("keywords", [])),
         tables=tuple(raw.get("tables", [])),
         sql=sql,
@@ -82,15 +85,33 @@ def _parse_metric(metric_id: str, raw: dict) -> MetricDefinition:
 
 def load_metrics_catalog(
     path: str | Path | None = None,
+    enforce_governance: bool = True,
 ) -> MetricRegistry:
+    """Load the metric catalog into a registry.
+
+    With enforce_governance (the default), a metric missing its governance
+    metadata (owner, approval) fails the load — an unapproved spec never
+    enters the registry, so it can never produce a number.
+    """
+    from .validator import validate_governance
+
     catalog_path = Path(path) if path else DEFAULT_CATALOG_PATH
 
     with open(catalog_path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
     registry = MetricRegistry()
+    governance_errors: list[str] = []
     for metric_id, raw in data.get("metrics", {}).items():
         metric = _parse_metric(metric_id, raw)
+        if enforce_governance:
+            governance_errors.extend(validate_governance(metric))
         registry.register(metric)
+
+    if governance_errors:
+        raise ValueError(
+            "Metric catalog failed governance validation:\n  "
+            + "\n  ".join(governance_errors)
+        )
 
     return registry

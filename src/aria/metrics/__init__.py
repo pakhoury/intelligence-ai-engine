@@ -4,7 +4,7 @@ from .llm_resolver import LLMMetricResolver
 from .loader import load_metrics_catalog
 from .registry import MetricDefinition, MetricRegistry
 from .resolver import MetricResolver, ResolvedMetric
-from .validator import validate_catalog, validate_metric
+from .validator import validate_catalog, validate_governance, validate_metric
 
 __all__ = [
     "MetricsCatalog",
@@ -16,6 +16,7 @@ __all__ = [
     "LLMMetricResolver",
     "MetricCompiler",
     "CompiledSQL",
+    "validate_governance",
     "validate_metric",
     "validate_catalog",
 ]

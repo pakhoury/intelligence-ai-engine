@@ -243,7 +243,8 @@ async def cache_check(state: dict):
                     "review_score": payload.get("review_score", 10.0),
                     "confidence": payload.get("confidence", "unknown"),
                 }
-                for field in ("resolved_metric", "metric_version", "route", "data_path"):
+                for field in ("resolved_metric", "metric_version", "metric_owner",
+                              "metric_approval", "route", "data_path"):
                     if payload.get(field):
                         result[field] = payload[field]
                 return result
@@ -403,6 +404,8 @@ def _build_metric_context(metric: MetricDefinition, extracted_params: dict) -> s
         f"Unit: {metric.unit}",
         f"Tables: {', '.join(metric.tables)}",
     ]
+    if metric.owner:
+        lines.append(f"Owner: {metric.owner}" + (f" | Approval: {metric.approval}" if metric.approval else ""))
 
     if metric.steps:
         lines.append("\nCalculation Steps:")
@@ -461,6 +464,8 @@ async def metric_resolver_node(state: dict):
         return {
             "resolved_metric": resolved.metric.metric_id,
             "metric_version": resolved.metric.version,
+            "metric_owner": resolved.metric.owner,
+            "metric_approval": resolved.metric.approval,
             "metric_context": metric_context,
             "metric_params": resolved.extracted_params,
         }
@@ -526,6 +531,8 @@ async def _try_compiled_metric(state: dict) -> dict | None:
             "node": "sql_path",
             "metric": compiled.metric_id,
             "version": compiled.version,
+            "owner": compiled.owner,
+            "approval": compiled.approval,
             "mode": compiled.compilation_mode,
             "sql": compiled.sql,
         },
@@ -953,6 +960,8 @@ async def cache_write(state: dict):
                 "confidence": state.get("confidence", "unknown"),
                 "resolved_metric": state.get("resolved_metric"),
                 "metric_version": state.get("metric_version"),
+                "metric_owner": state.get("metric_owner"),
+                "metric_approval": state.get("metric_approval"),
                 "route": state.get("route"),
                 "data_path": data_path,
             })

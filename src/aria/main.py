@@ -3,8 +3,9 @@ import json
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
+from authz import AuthzDecision, Principal, get_authz_client
 from config import redis_client
 from observability import (
     REQUEST_COUNT,
@@ -23,13 +25,52 @@ from observability import (
     trace_id_var,
     tracer,
 )
-from security import limiter, validate_question, verify_api_key
-from workflow import app as workflow_app
+import workflow
+from security import API_KEY_HEADER, limiter, validate_question
+
+_checkpointer_pool = None
+
+
+async def _authorize(
+    credential: str | None, action: str, resource: dict | None = None,
+) -> Principal | None:
+    """Policy Enforcement Point: hand the credential, action, and any resource
+    attributes this service already owns (e.g. a thread's recorded owner) to
+    the external RBAC service and enforce whatever it decides. Ownership and
+    role/permission logic live entirely in that service, not here.
+    """
+    decision: AuthzDecision = await get_authz_client().authorize(credential, action, resource)
+    if not decision.allowed:
+        logger.warning(
+            f"Authorization denied for action '{action}': {decision.reason}",
+            extra={"error": "authz_denied", "action": action},
+        )
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return decision.principal
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # AsyncPostgresSaver must be constructed inside a running event loop, so
+    # the persistent checkpointer is wired up here rather than at module
+    # import time. `workflow.app` (accessed fresh at each call site) is
+    # reassigned in place; anything that imported `workflow.app` before this
+    # ran would keep the in-memory default, so request handlers below read
+    # it via `workflow.app.*` rather than a captured binding.
+    global _checkpointer_pool
+    result = await workflow.create_persistent_app()
+    if result is not None:
+        workflow.app, _checkpointer_pool = result
+    yield
+    if _checkpointer_pool is not None:
+        await _checkpointer_pool.close()
+
 
 app = FastAPI(
     title="ARIA — Analytical Risk Intelligence Agent",
     docs_url="/docs",
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 app.state.limiter = limiter
@@ -121,8 +162,10 @@ async def observability_middleware(request: Request, call_next):
 async def query(
     request: Request,
     body: Query,
-    api_key: str = Depends(verify_api_key),
+    credential: str | None = Security(API_KEY_HEADER),
 ):
+    principal = await _authorize(credential, action="query:submit")
+
     # Validate and sanitize input
     question = validate_question(body.question)
 
@@ -135,11 +178,14 @@ async def query(
             history = await _load_history(session_id)
 
             result = await asyncio.wait_for(
-                workflow_app.ainvoke(
+                workflow.app.ainvoke(
                     {
                         "question": question,
                         "session_id": session_id,
                         "conversation_history": history,
+                        "trace_id": trace_id_var.get("no-trace"),
+                        "owner_id": principal.sub if principal else "unknown",
+                        "owner_tenant_id": (principal.tenant_id if principal else None) or "",
                     },
                     config={"configurable": {"thread_id": session_id}},
                 ),
@@ -178,6 +224,8 @@ async def query(
                     "route": result.get("route"),
                     "resolved_metric": result.get("resolved_metric"),
                     "metric_version": result.get("metric_version"),
+                    "metric_owner": result.get("metric_owner"),
+                    "metric_approval": result.get("metric_approval"),
                     "compiled": result.get("compiled_metric", False),
                     "confidence": result.get("confidence", "unknown"),
                     "data_path": result.get("data_path", "none"),
@@ -255,12 +303,38 @@ async def readiness():
 
 
 @app.get("/audit/{thread_id}")
-async def audit_trail(thread_id: str, api_key: str = Depends(verify_api_key)):
-    """Retrieve the full audit trail for a session — every node's input/output state."""
+async def audit_trail(thread_id: str, credential: str | None = Security(API_KEY_HEADER)):
+    """Retrieve the full audit trail for a session — every node's input/output state.
+
+    Ownership is resolved from the thread's own checkpointed state (recorded
+    at query time — see owner_id/owner_tenant_id in workflow.AgentState) and
+    handed to the RBAC service as a resource attribute; the service decides
+    whether this caller may read it (owner match, auditor role, admin role,
+    etc. — that policy lives entirely in the external service). Authorization
+    runs before the existence check below so a denied caller learns nothing
+    about whether the thread exists.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+
+    owner_id = None
+    owner_tenant_id = None
     try:
-        config = {"configurable": {"thread_id": thread_id}}
+        snapshot = await workflow.app.aget_state(config)
+        if snapshot and snapshot.values:
+            owner_id = snapshot.values.get("owner_id")
+            owner_tenant_id = snapshot.values.get("owner_tenant_id")
+    except Exception as e:
+        logger.warning(f"Could not resolve thread owner for authz: {e}", extra={"error": str(e)})
+
+    await _authorize(
+        credential,
+        action="audit:read",
+        resource={"type": "thread", "id": thread_id, "owner_id": owner_id, "tenant_id": owner_tenant_id},
+    )
+
+    try:
         states = []
-        for state in workflow_app.get_state_history(config):
+        async for state in workflow.app.aget_state_history(config):
             states.append({
                 "step": state.metadata.get("step", -1),
                 "node": state.metadata.get("source", "unknown"),

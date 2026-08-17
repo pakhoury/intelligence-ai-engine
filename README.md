@@ -1,6 +1,6 @@
 # ARIA — Analytical Risk Intelligence Agent
 
-A federated Retrieval-Augmented Generation platform that answers compliance and risk questions by combining **structured data** (Oracle SQL) with **unstructured knowledge** (hybrid document search: pgvector semantic + Postgres full-text, fused with Reciprocal Rank Fusion). The system classifies each question, selects an execution strategy, chains data sources when needed, compiles deterministic SQL for registered metrics, synthesizes an answer, and validates it through 5 deterministic validators + an LLM reviewer before caching.
+A federated Retrieval-Augmented Generation platform that answers compliance and risk questions by combining **structured data** (Oracle SQL) with **unstructured knowledge** (hybrid document search: pgvector semantic + Postgres full-text, fused with Reciprocal Rank Fusion). The system classifies each question, selects an execution strategy, chains data sources when needed, compiles deterministic SQL for registered metrics, synthesizes an answer, and validates it through 6 deterministic validators + an LLM reviewer before caching.
 
 Built for regulated financial services where answers must be grounded, auditable, and reproducible.
 
@@ -20,7 +20,7 @@ This system solves that with a **strategy-based hybrid pipeline**: an LLM classi
 | Dual-path SQL execution | Compiler-first: try deterministic compilation, fall through to LLM only if metric is unresolved or non-compilable. | Slight code complexity, but eliminates LLM hallucination for all registered metrics. |
 | Per-table catalog with on-demand loading | `database_metadata.json` index + one JSON per table. Tables loaded and cached only when needed. | More files to manage, but scales to 50+ tables without startup cost. |
 | Model fallback chain | Primary LLM (llama-3.3-70b) + fallback (llama-3.1-8b). Circuit breaker triggers automatic fallback. | Fallback model is smaller (lower quality), but service stays up. |
-| 5 deterministic validators | SQL safety, result sanity, answer grounding, number grounding, metric citation — each with independent score caps. | Adds review latency, but catches failures LLM reviewer misses. |
+| 6 deterministic validators | SQL safety, SQL scope, result sanity, answer grounding, number grounding, metric citation — each with independent score caps and a Prometheus counter (`rag_validator_failures_total{validator=...}`). | Adds review latency, but catches failures LLM reviewer misses. |
 | Confidence scoring | `high/medium/low` computed from: compiled vs LLM path, review score, validator failures. | Requires tuning thresholds, but gives users actionable trust signal. |
 | First-turn-only caching | Cache keyed on normalized question text; follow-ups (any request with history) bypass the cache entirely. Cached payload stores answer + review score + confidence + metric metadata. | Follow-ups never benefit from cache, but context-dependent answers can never leak across sessions. |
 | MemorySaver fatal in production | PostgreSQL checkpointer failure raises `RuntimeError` unless `ENVIRONMENT=development`. | Crashes the app on PG failure, but audit trail loss is unacceptable for compliance. |
@@ -29,7 +29,10 @@ This system solves that with a **strategy-based hybrid pipeline**: an LLM classi
 | Persistent PostgreSQL checkpointer | LangGraph state stored in PostgreSQL, surviving restarts. | Requires PG dependency, but enables regulatory audit trails. |
 | Non-blocking Redis via `asyncio.to_thread` | Cache, history operations run in background threads. | Thread pool overhead, but consistent with Oracle call pattern. |
 | Request-level timeout | `asyncio.wait_for` with configurable timeout (default 60s). Returns 504 on hang. | Kills slow queries, but prevents unbounded resource consumption. |
+| Per-node latency budgets | Each of the 11 nodes has an explicit SLO in `NODE_LATENCY_BUDGETS_MS`; a breach increments `rag_node_budget_exceeded_total{node=...}` and logs a warning. | Observability only — never fails or cancels a request (that's `REQUEST_TIMEOUT`'s job) — so it surfaces *which stage* is burning the budget before the aggregate timeout trips, without adding a new failure mode. |
 | PII redaction + DLP gate | Two-layer defense: SQL results scrubbed pre-answer, final answer scanned post-review. | Regex-based (no NER), but catches emails, SSNs, phones, cards, IBANs with negligible latency. |
+| Authorization delegated to an external RBAC service | `/query` and `/audit/{thread_id}` hand the credential + action (+ resource owner, for audit reads) to a pluggable PDP over HTTP; this app hardcodes no roles or permissions. | Requires standing up (or stubbing) that service; adds one network hop per request, mitigated by a circuit breaker. |
+| Reproducibility regression test | Golden cases replay through the full workflow twice with identical mocked LLM/DB/vector responses; any output divergence flags a non-deterministic code path. | Adds one extra full-workflow invocation per golden case in CI, but caught a real bug (see `## Correctness & Validation`). |
 
 ## System Architecture
 
@@ -42,7 +45,7 @@ This system solves that with a **strategy-based hybrid pipeline**: an LLM classi
                        |  POST /query|
                        +------+------+
                               |
-                       [Auth + Rate Limit + Input Validation]
+                  [RBAC Authz + Rate Limit + Input Validation]
                               |
                               v
                      +--------+--------+
@@ -89,7 +92,7 @@ This system solves that with a **strategy-based hybrid pipeline**: an LLM classi
                                   v                 |
                           +-------+-------+         |
                           |   reviewer    |---------+
-                          | (LLM + 5     |   (if score < 7
+                          | (LLM + 6     |   (if score < 7
                           |  validators) |    and attempts < 2)
                           +-------+-------+
                                   |
@@ -192,17 +195,20 @@ Each metric is defined in `metrics_catalog.yaml` with: formula, calculation step
 
 ## Correctness & Validation
 
-### 5 Deterministic Validators
+### 6 Deterministic Validators
 
-Every answer passes through 5 validators that run alongside the LLM reviewer. Each has an independent score cap:
+Every answer passes through 6 validators that run alongside the LLM reviewer. Each has an independent score cap and increments `rag_validator_failures_total{validator=...}` on failure:
 
 | Validator | What It Catches | Score Cap |
 |-----------|----------------|-----------|
 | **SQL Safety** | DROP, DELETE, injection, unbalanced parens, statement chaining | 0.0 |
+| **SQL Scope** | SQL referencing tables outside the governed catalog allowlist | 0.0 |
 | **Result Sanity** | Empty results, execution errors, suspiciously large numbers | 3.0-6.0 |
 | **Answer Grounding** | Answer claims data but no SQL/docs were retrieved | 3.0 |
 | **Number Grounding** | Numeric claims in answer don't appear in SQL result | 5.0 |
 | **Metric Citation** | Compiled metric answer doesn't reference the metric name | 6.0 |
+
+Failures also carry a `fixable` flag: SQL-safety/scope, result-sanity, and no-data-grounding failures are rooted in the retrieved data, not the answer text, so they set an `unfixable_cap` that reapplies on every reflection cycle — the workflow skips reflection entirely rather than burning cycles it can never win (see `skip_reflection` in `workflow.py`).
 
 ### Confidence Scoring
 
@@ -213,6 +219,12 @@ Every response includes a confidence level computed from the execution path:
 | **high** | Compiled metric + review score >= 8.0 + no validator failures |
 | **medium** | LLM SQL path + good score + supporting data; or compiled with moderate score |
 | **low** | Retries needed, validator failures, or low review score |
+
+### Reproducibility
+
+"Same input = same output" is the core auditability claim of the governed metric path — a regulator re-running the same question against the same data must get the same answer. `TestEvalConsistency` in `tests/test_eval.py` enforces this directly: every golden case runs through the full workflow **twice** with identical mocked LLM/DB/vector responses (external dependencies pinned, so the LLM itself is never a source of variance), and asserts `route`, `final_answer`, `review_score`, `confidence`, `data_path`, `resolved_metric`, and `sql_result` are byte-identical between runs. Any divergence means the *application code* has a non-deterministic path, not the model.
+
+This test caught a real bug: `database/base.py`'s keyword-based table-selection fallback (`_keyword_fallback`, used when LLM table selection fails) built its result from a Python `set()` and returned `list(relevant)[:8]`. Set iteration order for strings depends on the process's hash seed, which is randomized by default (`PYTHONHASHSEED`) — with more than 8 matching tables, the same question could select a different arbitrary subset of tables across process restarts. Fixed by sorting before truncating (`sorted(relevant)[:8]`), covered by dedicated tests in `tests/test_database.py`.
 
 ## Scalability
 
@@ -260,6 +272,7 @@ catalog/
 | Vector Store | PostgreSQL 16 + PGVector | Semantic search with JSONB metadata filtering |
 | Cache | Redis 7 | Response caching (24h TTL) + conversation history (1h TTL) |
 | Checkpointer | PostgreSQL (langgraph-checkpoint-postgres) | Persistent audit trail (mandatory in production) |
+| Authorization | External RBAC/PDP service via HTTP (`httpx`, pluggable — none bundled) | Identity resolution + permission decisions for `/query` and `/audit/{thread_id}` |
 | Metrics | Prometheus + Grafana | Request latency, LLM tokens/cost, cache hit rate, review scores |
 | Tracing | OpenTelemetry (OTLP) | Distributed tracing with per-node spans |
 | CI/CD | GitHub Actions | Lint -> All tests -> Docker build |
@@ -280,10 +293,11 @@ intelligence-ai-engine/
 │   ├── config.py                   # LLM (primary + fallback), DB, Redis init
 │   ├── workflow.py                 # LangGraph: 11 nodes, 5 strategies, reflection
 │   ├── nodes.py                    # All workflow nodes + compiled metric path
-│   ├── security.py                 # Auth, rate limit, injection guard, PII, DLP
+│   ├── security.py                 # Input validation, rate limit, injection guard, PII, DLP
+│   ├── authz.py                    # RBAC/PDP client — identity + authorization decisions (external service)
 │   ├── observability.py            # OTel + Prometheus + structured JSON logging
 │   ├── llm_ops.py                  # Cost tracking, context window, model fallback chain
-│   ├── validators.py               # 5 deterministic validators
+│   ├── validators.py               # 6 deterministic validators
 │   ├── circuit_breaker.py          # Circuit breaker for LLM calls
 │   ├── metrics_catalog.yaml        # 7 metric definitions with formulas + thresholds
 │   ├── catalog/                    # Per-table database schema catalog
@@ -314,15 +328,23 @@ intelligence-ai-engine/
 │
 ├── tests/
 │   ├── conftest.py                 # Shared fixtures
-│   ├── test_nodes.py               # ~60 node-level unit tests
+│   ├── test_nodes.py               # 72 node-level unit tests
 │   ├── test_metric_compiler.py     # 39 golden tests: resolver -> compiler -> SQL
-│   ├── test_validators.py          # 39 validator tests (all 5 validators)
-│   ├── test_eval.py                # 56 evaluation tests (21 golden cases)
+│   ├── test_validators.py          # 64 validator tests (all 6 validators)
+│   ├── test_eval.py                # 84 evaluation tests (21 golden cases incl. reproducibility)
 │   ├── golden_dataset.yaml         # 21 golden cases: all routes + edge cases
-│   ├── test_workflow.py            # 10 workflow integration tests
-│   ├── test_metrics.py             # ~140 metric pipeline tests
-│   ├── test_security.py            # ~35 security tests
-│   └── test_hybrid_rag.py          # E2E tests (requires live infrastructure)
+│   ├── test_workflow.py            # 12 workflow integration tests
+│   ├── test_metrics.py             # 72 metric pipeline tests
+│   ├── test_security.py            # 40 security tests
+│   ├── test_authz.py               # 11 RBAC/authz client tests (fail-closed, circuit breaker, dev stub)
+│   ├── test_circuit_breaker.py     # 13 circuit breaker tests (state transitions, Prometheus gauge)
+│   ├── test_observability.py       # 9 latency budget tests (NodeTimer integration)
+│   ├── test_llm_resolver.py        # 19 LLM-based metric resolver tests
+│   ├── test_hybrid_search.py       # 13 hybrid retrieval (vector + lexical RRF) tests
+│   ├── test_database.py            # 5 keyword table-selection fallback / determinism tests
+│   ├── test_ingest.py              # 7 document ingestion tests
+│   ├── eval/test_sql_golden.py     # 30 SQL generation golden tests
+│   └── test_hybrid_rag.py          # Standalone E2E script (not pytest) — run directly, requires live infra
 │
 ├── oracle-init/                    # DB init scripts (auto-run on first start)
 ├── monitoring/
@@ -361,13 +383,15 @@ POSTGRES_HOST=localhost
 ENVIRONMENT=development
 ```
 
+With `ENVIRONMENT=development` and no `AUTHZ_SERVICE_URL` set, `/query` and `/audit/{thread_id}` use an allow-all dev stub — no external RBAC service needed to run locally or in CI. To exercise real authorization, point `AUTHZ_SERVICE_URL` at a policy service implementing the contract in [Authorization & Audit Trail](#authorization--audit-trail).
+
 ### 2. Start
 
 ```bash
-# Production (4 workers, audit trail enforced)
+# Production (4 workers, audit trail + RBAC authorization enforced — both fail closed)
 docker-compose -f docker-compose.yml up -d
 
-# Development (hot reload, MemorySaver allowed)
+# Development (hot reload, MemorySaver + allow-all authz stub permitted)
 docker-compose up -d
 ```
 
@@ -413,9 +437,9 @@ curl -X POST http://localhost:8000/query \
 }
 ```
 
-**Headers:** `X-API-Key` (required when `API_KEYS` is configured). Response includes `X-Trace-ID`.
+**Headers:** `X-API-Key` — forwarded as the credential to the RBAC service for the `query:submit` decision (see [Authorization & Audit Trail](#authorization--audit-trail)). Response includes `X-Trace-ID`.
 
-**Rate limit:** 30 requests/minute per API key or IP.
+**Rate limit:** 30 requests/minute per API key or IP (a separate, local check from the RBAC authorization decision).
 
 ### GET /health
 
@@ -427,7 +451,7 @@ Readiness probe. Returns 200 if Oracle, PostgreSQL, and Redis are all reachable;
 
 ### GET /audit/{thread_id}
 
-Full state history for a session — every node's input/output state, step number, timestamp.
+Full state history for a session — every node's input/output state, step number, timestamp. Requires the `audit:read` decision from the RBAC service, evaluated against the thread's recorded `owner_id`/`owner_tenant_id` (see [Authorization & Audit Trail](#authorization--audit-trail)). Returns 403 before revealing whether the thread exists if the caller isn't authorized.
 
 ### GET /metrics
 
@@ -458,8 +482,8 @@ History stored in Redis (1h TTL, last 10 turns, last 5 sent to LLM). All history
 
 | Layer | Threat | Mitigation |
 |-------|--------|------------|
-| **Network** | Unauthorized access | API key authentication via `X-API-Key` header |
-| **Network** | Abuse / DoS | Rate limiting at 30 req/min per API key or IP. Request timeout (default 60s) |
+| **Network** | Unauthorized access | `X-API-Key` credential forwarded to an external RBAC service (`authz.py`) for identity + permission decisions on every `/query` and `/audit/{thread_id}` call. Fails closed if unconfigured outside dev. See [Authorization & Audit Trail](#authorization--audit-trail). |
+| **Network** | Abuse / DoS | Rate limiting at 30 req/min per API key or IP (local, independent of the RBAC decision). Request timeout (default 60s) |
 | **Input** | Prompt injection | 11 regex patterns detect injection attempts. HTTP 400 on match |
 | **Input** | Oversized input | Min 3, max 2,000 characters |
 | **Context** | History-based injection | `sanitize_for_prompt()` strips injection markers, HTML tags |
@@ -469,9 +493,34 @@ History stored in Redis (1h TTL, last 10 turns, last 5 sent to LLM). All history
 | **Output** | PII in final answer | DLP gate in reviewer. PII redacted, score capped at 6.0 |
 | **Container** | Privilege escalation | Non-root `appuser` inside container |
 
+## Authorization & Audit Trail
+
+Identity and permissions are **not** modeled locally. `src/aria/authz.py` implements a Policy Enforcement Point (PEP) that hands every authorization decision to an external Policy Decision Point (PDP) — the same split used by OPA, AWS Verified Permissions, and Zanzibar-style authorizers (NIST SP 800-162 ABAC guidance). This app never hardcodes a role or a permission; it only enforces whatever the external service returns.
+
+```
+POST {AUTHZ_SERVICE_URL}/v1/authorize
+→ {"credential": "<X-API-Key value>", "action": "query:submit" | "audit:read", "resource": {...} | null}
+← {"allow": true, "principal": {"sub": "user-123", "tenant_id": "org-456", "roles": ["analyst"]}, "reason": "..."}
+```
+
+**Ownership flow:**
+1. `/query` requests `query:submit`. The PDP's returned `principal.sub`/`tenant_id` is written into the LangGraph checkpointed state as `owner_id`/`owner_tenant_id` (see `AgentState` in `workflow.py`) — so every thread durably records who created it.
+2. `/audit/{thread_id}` first peeks at that thread's own checkpoint (`aget_state`) to recover its recorded owner, then requests `audit:read` with `resource.owner_id`/`resource.tenant_id` attached. The PDP decides — owner match, an `auditor`/`admin` role, or any other policy it implements — this app doesn't hardcode that logic.
+3. Authorization is checked **before** the existence check, so a denied caller can't distinguish "not yours" from "thread doesn't exist."
+
+**Fails closed, always.** Any non-2xx response, timeout, malformed JSON, or open circuit is treated as a deny — this is the opposite of the LLM path, which fails *over* to a fallback model. An authorization gate must never fail open. Calls to the PDP go through the same `CircuitBreaker` used for LLM calls (`circuit_breaker.py`), so `rag_circuit_breaker_state{name="authz"}` and `rag_circuit_breaker_trips_total{name="authz"}` show up in Prometheus/Grafana alongside the LLM breaker automatically.
+
+**No PDP configured?** With `AUTHZ_SERVICE_URL` unset:
+- `ENVIRONMENT=development` → an allow-all dev stub (`DevStubAuthzClient`) is used, so local dev and CI need no external dependency.
+- Any other environment → `get_authz_client()` raises at first use. Same fail-closed-outside-dev pattern already used by `verify_api_key` (legacy local key check, still used for rate-limit bucketing — see below) and the PostgreSQL checkpointer.
+
+**What this app does NOT implement:** the actual RBAC/PDP service, its role/permission model, or its identity store. `authz.py` is the integration point — point `AUTHZ_SERVICE_URL` at a real policy service (OPA, a custom identity/authz microservice, etc.) to enforce real access control.
+
+**Rate limiting is a separate, local concern.** `security._key_func` still buckets by a locally-configured `API_KEYS` set (or falls back to client IP) purely to assign rate-limit buckets cheaply and synchronously — it does **not** decide who is authorized to do what. That decision always goes through `authz.py`.
+
 ## Observability
 
-### Prometheus Metrics (20+ families)
+### Prometheus Metrics (17 families)
 
 | Metric | Type | Labels |
 |--------|------|--------|
@@ -485,10 +534,32 @@ History stored in Redis (1h TTL, last 10 turns, last 5 sent to LLM). All history
 | `rag_llm_cost_usd` | Counter | `node` |
 | `rag_node_duration_seconds` | Histogram | `node` |
 | `rag_node_errors_total` | Counter | `node` |
+| `rag_node_budget_exceeded_total` | Counter | `node` |
 | `rag_review_score` | Histogram | — |
 | `rag_reflection_total` | Counter | — |
-| `rag_circuit_breaker_state` | Gauge | `name` |
+| `rag_circuit_breaker_state` | Gauge | `name` (0=closed, 1=open, 2=half_open) |
+| `rag_circuit_breaker_trips_total` | Counter | `name` |
 | `rag_validator_failures_total` | Counter | `validator` |
+| `rag_app` | Info | `version`, `llm_model`, `llm_provider` |
+
+`name` on the two circuit-breaker metrics is currently `llm` (Groq calls, `circuit_breaker.py`) or `authz` (RBAC service calls, `authz.py`) — both breakers share the same `CircuitBreaker` class and report to the same metrics. `rag_validator_failures_total` is labeled by validator name (`sql_safety`, `sql_scope`, `result_sanity`, `answer_grounding`, `number_grounding`, `metric_citation`).
+
+### Latency Budgets
+
+Every node has an explicit SLO in milliseconds (`NODE_LATENCY_BUDGETS_MS` in `observability.py`), checked against its measured duration in `NodeTimer.__exit__` — the same wrapper every node in `nodes.py` already uses for tracing and the duration histogram:
+
+| Node | Budget (ms) | Why |
+|------|-------------|-----|
+| `cache_check`, `cache_write` | 100 | Redis round trip only, no LLM call |
+| `context_resolver`, `router`, `clarify` | 1,000 | Single LLM call each |
+| `metric_resolver` | 1,500 | LLM call + JSON parsing |
+| `vector_retrieval` | 1,500 | Vector + lexical search run concurrently, no LLM call |
+| `extract` | 1,200 | Single LLM call |
+| `reviewer` | 1,800 | LLM call + 6 deterministic validators |
+| `answer_generator` | 2,500 | Single LLM call, largest prompt |
+| `sql_path` | 4,000 | Up to 3 LLM calls (table selection + generation + retries) + DB execution |
+
+These are initial engineering estimates — tune them from real `rag_node_duration_seconds` production data once traffic exists. **A budget breach is observability-only:** it increments `rag_node_budget_exceeded_total{node=...}`, logs a warning, and tags the OTel span with `node.budget_exceeded` — it never fails or cancels the request. That's deliberate: `REQUEST_TIMEOUT` already exists as the hard, request-level kill switch (60s default); per-node budgets exist to show *which stage* is burning that aggregate budget before it trips, not to add a second way for a request to fail.
 
 ### Grafana Dashboard
 
@@ -506,7 +577,7 @@ Every node and LLM call wrapped in OTel spans. Set `OTEL_EXPORTER_OTLP_ENDPOINT`
 
 ## Testing
 
-### 379 Tests, 7 Suites
+### 490 Tests, 15 Suites
 
 ```bash
 pytest tests/ -v    # All tests, no infrastructure required
@@ -514,13 +585,23 @@ pytest tests/ -v    # All tests, no infrastructure required
 
 | Suite | Tests | Coverage |
 |-------|-------|----------|
-| `test_nodes.py` | ~60 | Every workflow node in isolation |
+| `test_eval.py` | 84 | 21 golden cases: routing + answer quality + confidence + reproducibility |
+| `test_nodes.py` | 72 | Every workflow node in isolation |
+| `test_metrics.py` | 72 | Registry, loader, resolver, LLM resolver, compiler, validator |
+| `test_validators.py` | 64 | All 6 deterministic validators |
+| `test_security.py` | 40 | Input validation, injection, PII, DLP |
 | `test_metric_compiler.py` | 39 | Resolver -> compiler -> SQL for all 7 metrics |
-| `test_validators.py` | 39 | All 5 deterministic validators |
-| `test_eval.py` | 56 | 21 golden cases: routing + answer quality + confidence |
-| `test_workflow.py` | 10 | Full graph integration, all 5 routes |
-| `test_metrics.py` | ~140 | Registry, loader, resolver, LLM resolver, compiler, validator |
-| `test_security.py` | ~35 | Auth, rate limits, injection, PII, DLP |
+| `eval/test_sql_golden.py` | 30 | SQL generation golden set |
+| `test_llm_resolver.py` | 19 | LLM-based metric resolution |
+| `test_circuit_breaker.py` | 13 | State transitions, Prometheus gauge/counter wiring |
+| `test_hybrid_search.py` | 13 | Vector + lexical retrieval, RRF fusion |
+| `test_workflow.py` | 12 | Full graph integration, all 5 routes + async-checkpointer regression |
+| `test_authz.py` | 11 | RBAC client: allow/deny, fail-closed, circuit breaker, dev stub |
+| `test_observability.py` | 9 | Latency budget checks, NodeTimer integration |
+| `test_ingest.py` | 7 | Document ingestion (PDF + Excel) |
+| `test_database.py` | 5 | Keyword table-selection fallback, determinism |
+
+`test_hybrid_rag.py` is a standalone script (`python tests/test_hybrid_rag.py`), not a pytest suite — it exercises all three routes against live infrastructure and isn't included in the count above.
 
 ### Golden Evaluation Dataset
 
@@ -531,6 +612,7 @@ pytest tests/ -v    # All tests, no infrastructure required
 - SQL injection attempts (DROP, comment injection)
 - Chained strategies (docs_then_sql, sql_then_docs)
 - Confidence scoring validation
+- Reproducibility (each case is replayed twice against identical mocked inputs and asserted byte-identical — see [Reproducibility](#reproducibility))
 
 ### CI Pipeline
 
@@ -548,8 +630,10 @@ GitHub Actions on every push to `main`/`develop`:
 | `LLM_FALLBACK_MODEL` | `llama-3.1-8b-instant` | Fallback LLM model |
 | `LLM_TIMEOUT` | `30` | LLM request timeout (seconds) |
 | `REQUEST_TIMEOUT` | `60` | Workflow execution timeout (seconds) |
-| `ENVIRONMENT` | `development` | `development` allows MemorySaver fallback; anything else enforces PostgreSQL checkpointer |
-| `API_KEYS` | *(empty = auth disabled)* | Comma-separated valid API keys |
+| `ENVIRONMENT` | `development` | `development` allows the PostgreSQL checkpointer *and* RBAC authorization to fall back to permissive local defaults; anything else enforces both (fails closed) |
+| `AUTHZ_SERVICE_URL` | *(empty)* | Base URL of the external RBAC/PDP service (`authz.py`). Empty + `ENVIRONMENT=development` → allow-all dev stub. Empty in any other environment → authorization fails closed. |
+| `AUTHZ_TIMEOUT` | `3` | Timeout (seconds) for calls to the RBAC service |
+| `API_KEYS` | *(empty)* | Comma-separated keys used only for local rate-limit bucketing (`security._key_func`) — **not** the authorization decision, which is delegated to `AUTHZ_SERVICE_URL` |
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma-separated allowed origins |
 | `REDIS_HOST` | `localhost` | Redis host |
 | `POSTGRES_HOST` | `localhost` | PostgreSQL host |
@@ -568,7 +652,8 @@ GitHub Actions on every push to `main`/`develop`:
 | PG checkpointer down (prod) | **App crashes with RuntimeError.** Audit trail loss is not tolerated. |
 | PG checkpointer down (dev) | Falls back to MemorySaver with warning. Audit trail lost on restart. |
 | LLM generates bad SQL | Column validation catches errors pre-execution. Error fed back for retry (up to 2). |
-| LLM reviewer unparseable | Score defaults to 0.0, triggering reflection loop. |
+| LLM reviewer unparseable | Score defaults to 7.0 (the pass threshold) rather than 0.0 — an unparseable *format* shouldn't force a full reflection loop. The 6 deterministic validators still apply independently and can still cap the score below threshold. |
+| RBAC/authz service down or misconfigured (prod) | **Fails closed.** Circuit breaker opens after repeated failures; `/query` and `/audit/{thread_id}` return 403 until it recovers. Never falls back to allow-all outside `ENVIRONMENT=development`. |
 | Request timeout | `asyncio.wait_for` kills workflow after `REQUEST_TIMEOUT`. Returns HTTP 504. |
 
 ## Operations

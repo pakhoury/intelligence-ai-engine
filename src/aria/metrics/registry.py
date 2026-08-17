@@ -47,7 +47,14 @@ class MetricParameter:
 
 @dataclass(frozen=True)
 class MetricDefinition:
-    """Immutable, versioned metric definition — the unit of the registry."""
+    """Immutable, versioned metric definition — the unit of the registry.
+
+    Governance fields make the spec an accountable artifact: `owner` is the
+    team answerable for the calculation, `approval` references the review
+    that authorized it (e.g. an MRM ticket), and `rounding` names the
+    output rounding policy. The loader refuses catalogs whose metrics lack
+    owner or approval — an unapproved spec never enters the registry.
+    """
     metric_id: str
     name: str
     version: str
@@ -55,6 +62,9 @@ class MetricDefinition:
     category: str
     unit: str
     formula: str
+    owner: str = ""
+    approval: str = ""
+    rounding: str = ""
     keywords: tuple[str, ...] = ()
     tables: tuple[str, ...] = ()
     sql: MetricSQL | None = None

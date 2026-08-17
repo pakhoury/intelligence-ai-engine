@@ -80,6 +80,8 @@ services:
       - LLM_MODEL=llama-3.3-70b-versatile
       - LLM_TIMEOUT=30
       - LLM_MAX_RETRIES=3
+      - AUTHZ_SERVICE_URL=
+      - AUTHZ_TIMEOUT=3
     deploy:
       resources:
         limits:

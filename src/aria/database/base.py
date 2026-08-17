@@ -249,7 +249,7 @@ class DatabaseConnector(ABC):
                 if any(word in table_name or word in desc_upper for word in words):
                     relevant.add(table_name)
 
-        return list(relevant)[:8]
+        return sorted(relevant)[:8]
 
     # ── Abstract methods (each dialect must implement) ───────────────
 

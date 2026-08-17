@@ -166,6 +166,76 @@ class TestLoader:
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# Governance
+# ═════════════════════════════════════════════════════════════════════════
+
+UNGOVERNED_CATALOG = """
+metrics:
+  rogue_metric:
+    name: "Rogue Metric"
+    version: "1.0"
+    formula: "COUNT(*)"
+    keywords: ["rogue"]
+    tables: ["COMPLIANCE_VIOLATIONS"]
+"""
+
+
+class TestGovernance:
+    def test_all_catalog_metrics_have_owner_and_approval(self):
+        registry = load_metrics_catalog()
+        for m in registry.all_metrics:
+            assert m.owner, f"{m.metric_id} missing owner"
+            assert m.approval, f"{m.metric_id} missing approval"
+
+    def test_governance_fields_loaded(self):
+        registry = load_metrics_catalog()
+        m = registry.get("compliance_effectiveness_score")
+        assert m.owner == "compliance-analytics"
+        assert m.approval == "MRM-2026-0117"
+        assert m.rounding == "percentage_2dp"
+
+    def test_ungoverned_catalog_refused(self, tmp_path):
+        path = tmp_path / "catalog.yaml"
+        path.write_text(UNGOVERNED_CATALOG)
+        with pytest.raises(ValueError, match="governance"):
+            load_metrics_catalog(path)
+
+    def test_ungoverned_catalog_loadable_without_enforcement(self, tmp_path):
+        path = tmp_path / "catalog.yaml"
+        path.write_text(UNGOVERNED_CATALOG)
+        registry = load_metrics_catalog(path, enforce_governance=False)
+        assert "rogue_metric" in registry
+
+    def test_validate_governance_reports_missing_fields(self):
+        from metrics.validator import validate_governance
+        metric = MetricDefinition(
+            metric_id="m", name="M", version="1.0",
+            description="", category="", unit="", formula="x",
+        )
+        errors = validate_governance(metric)
+        assert len(errors) == 2
+        assert any("owner" in e for e in errors)
+        assert any("approval" in e for e in errors)
+
+    def test_validate_governance_passes_governed_metric(self):
+        from metrics.validator import validate_governance
+        metric = MetricDefinition(
+            metric_id="m", name="M", version="1.0",
+            description="", category="", unit="", formula="x",
+            owner="risk-analytics", approval="MRM-2026-0001",
+        )
+        assert validate_governance(metric) == []
+
+    def test_compiled_sql_carries_governance(self):
+        registry = load_metrics_catalog()
+        metric = registry.get("compliance_effectiveness_score")
+        compiled = MetricCompiler().compile(metric)
+        assert compiled.owner == "compliance-analytics"
+        assert compiled.approval == "MRM-2026-0117"
+        assert compiled.rounding == "percentage_2dp"
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # Resolver
 # ═════════════════════════════════════════════════════════════════════════
 

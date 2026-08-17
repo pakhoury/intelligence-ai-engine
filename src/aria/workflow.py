@@ -25,6 +25,9 @@ class AgentState(TypedDict, total=False):
     question: str
     original_question: str
     session_id: str
+    trace_id: str
+    owner_id: str  # principal.sub resolved by the RBAC service — for audit correlation and ownership checks
+    owner_tenant_id: str
     conversation_history: list
     cache_hit: bool
     final_answer: str
@@ -39,6 +42,8 @@ class AgentState(TypedDict, total=False):
     extracted_context: str
     resolved_metric: str
     metric_version: str
+    metric_owner: str
+    metric_approval: str
     metric_context: str
     metric_params: dict
     compiled_metric: bool
@@ -174,28 +179,55 @@ workflow.add_conditional_edges(
 workflow.add_edge("cache_write", END)
 
 
-def _create_checkpointer():
-    """Create persistent PostgreSQL checkpointer.
-
-    In production (ENVIRONMENT != 'development'), failure to connect is fatal —
-    audit trail loss is unacceptable. In dev, falls back to in-memory.
-    """
+def _pg_conn_string() -> str:
     pg_user = os.getenv("POSTGRES_USER", "postgres")
     pg_password = os.getenv("POSTGRES_PASSWORD", "postgres")
     pg_host = os.getenv("POSTGRES_HOST", "localhost")
     pg_db = os.getenv("POSTGRES_DB", "rag_db")
-    conn_string = f"postgresql://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
+    return f"postgresql://{pg_user}:{pg_password}@{pg_host}:5432/{pg_db}"
+
+
+# Compiled with an in-memory checkpointer by default — safe to import with no
+# running event loop (tests, tooling) and used as-is whenever the persistent
+# checkpointer below can't be established. `create_persistent_app()` swaps
+# this module attribute for a Postgres-backed graph once a real event loop is
+# running (see main.py's lifespan); callers must access it as `workflow.app`
+# (module-attribute lookup), not via a `from workflow import app` binding
+# captured before startup, or they'll keep pointing at the in-memory default.
+app = workflow.compile(checkpointer=MemorySaver())
+
+
+async def create_persistent_app():
+    """Build a PostgreSQL-backed compiled graph for a persistent audit trail.
+
+    Must run inside a live event loop — AsyncPostgresSaver binds to
+    asyncio.get_running_loop() at construction time, so this cannot be called
+    at plain module-import time (see main.py's lifespan startup hook).
+
+    In production (ENVIRONMENT != 'development'), failure to connect is fatal —
+    audit trail loss is unacceptable. In dev, returns None so the caller keeps
+    the in-memory default.
+
+    Returns:
+        (compiled_app, pool) on success, or None to keep the in-memory default.
+    """
     is_dev = os.getenv("ENVIRONMENT", "development") == "development"
 
     try:
-        import psycopg
-        from langgraph.checkpoint.postgres import PostgresSaver
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from psycopg_pool import AsyncConnectionPool
 
-        conn = psycopg.connect(conn_string, autocommit=True)
-        checkpointer = PostgresSaver(conn=conn)
-        checkpointer.setup()
+        pool = AsyncConnectionPool(
+            _pg_conn_string(),
+            open=False,
+            kwargs={"autocommit": True, "prepare_threshold": 0},
+        )
+        await pool.open()
+        checkpointer = AsyncPostgresSaver(conn=pool)
+        await checkpointer.setup()
+        persistent_app = workflow.compile(checkpointer=checkpointer)
         logger.info("Using PostgreSQL checkpointer for persistent audit trail")
-        return checkpointer
+        return persistent_app, pool
     except Exception as e:
         if not is_dev:
             raise RuntimeError(
@@ -207,8 +239,4 @@ def _create_checkpointer():
             f"PostgreSQL checkpointer unavailable ({e}), falling back to in-memory. "
             f"Audit trail will NOT survive restarts.",
         )
-        return MemorySaver()
-
-
-checkpointer = _create_checkpointer()
-app = workflow.compile(checkpointer=checkpointer)
+        return None
